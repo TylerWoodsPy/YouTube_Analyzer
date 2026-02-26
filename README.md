@@ -188,4 +188,4 @@ streamlit run app.py
 
 ## License
 
-MIT (or preferred license)
+MIT
