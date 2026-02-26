@@ -4,4 +4,4 @@ plotly
 google-api-python-client
 python-dotenv
 isodate
-sklearn
+scikit-learn
