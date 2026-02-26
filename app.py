@@ -11,6 +11,7 @@ from yt_api import (
 )
 
 from transform import videos_to_rows
+
 from db import (
     upsert_channel,
     upsert_videos,
@@ -68,7 +69,15 @@ def _bucket_time(d: pd.DataFrame, gran: str) -> pd.DataFrame:
     else:
         dd["bucket"] = dd["published"].dt.to_period("M").dt.start_time
 
-    ts = dd.groupby("bucket", as_index=False)["views"].sum()
+    ts = (
+        dd.groupby("bucket")
+        .agg(
+            views=("views", "sum"),
+            titles=("title", lambda x: list(x))
+        )
+        .reset_index()
+    )
+
     ts["bucket"] = pd.to_datetime(ts["bucket"])
     return ts
 
@@ -191,7 +200,23 @@ if "df" in st.session_state:
         ts = _bucket_time(df_filt, granularity)
 
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=ts["bucket"], y=ts["views"], mode="lines", name="Views"))
+        hover_text = ts["titles"].apply(
+            lambda vids: "<br>".join(vids[:5]) +
+                         ("<br>..." if len(vids) > 5 else "")
+        )
+
+        fig.add_trace(go.Scatter(
+            x=ts["bucket"],
+            y=ts["views"],
+            mode="lines",
+            name="Views",
+            customdata=hover_text,
+            hovertemplate=
+            "<b>Date:</b> %{x}<br>"
+            "<b>Views:</b> %{y:,}<br><br>"
+            "<b>Videos:</b><br>%{customdata}"
+            "<extra></extra>"
+        ))
 
         if "Rolling average" in overlays:
             roll = ts["views"].rolling(window=rolling_window, min_periods=1).mean()
