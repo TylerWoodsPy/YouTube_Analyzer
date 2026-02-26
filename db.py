@@ -210,3 +210,27 @@ def load_snapshot_deltas_df(channel_id: str, db_path: str = DB):
         df = pd.read_sql_query(q, conn, params=(channel_id,))
     df["snapshot_at_utc"] = pd.to_datetime(df["snapshot_at_utc"])
     return df
+
+def load_all_videos_df(db_path: str = DB):
+    """Load ALL videos across all channels."""
+    import pandas as pd
+    init_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        df = pd.read_sql_query(
+            "SELECT * FROM videos ORDER BY published_at ASC",
+            conn,
+        )
+    df["published_at"] = pd.to_datetime(df["published_at"], utc=True, errors="coerce")
+    return df
+
+
+def load_channels_df(db_path: str = DB):
+    """Load channel-level stats."""
+    import pandas as pd
+    init_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        df = pd.read_sql_query(
+            "SELECT * FROM channels",
+            conn,
+        )
+    return df

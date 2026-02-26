@@ -12,17 +12,20 @@ from yt_api import (
 
 from transform import videos_to_rows
 
+from model_views import build_feature_frame, train_view_model
+
 from db import (
     upsert_channel,
     upsert_videos,
     load_videos_df,
+    load_all_videos_df,
     get_last_fetch,
     get_existing_video_ids,
     insert_video_snapshots,
     load_snapshot_deltas_df,
 )
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time
 
 st.set_page_config(page_title="YouTube Channel Analyzer", layout="wide")
 st.title("📊 YouTube Channel Analyzer")
@@ -187,8 +190,8 @@ if "df" in st.session_state:
         (df["published"].dt.date <= end_date)
     ].copy()
 
-    tab_overview, tab_performance, tab_relationships, tab_outliers, tab_growth, tab_table = st.tabs(
-        ["Overview", "Performance", "Relationships", "Winners & Outliers", "Growth & Velocity", "Table"]
+    tab_overview, tab_performance, tab_relationships, tab_outliers, tab_growth, tab_predict, tab_table = st.tabs(
+        ["Overview", "Performance", "Relationships", "Winners & Outliers", "Growth & Velocity", "Predict Views", "Table"]
     )
 
     # -----------------------------
@@ -275,6 +278,129 @@ if "df" in st.session_state:
             hover_name="title",
         )
         st.plotly_chart(fig_sc2, use_container_width=True)
+
+
+    # -----------------------------
+    # Predict tab
+    # -----------------------------
+    with tab_predict:
+        st.subheader("Predict Views (global model across all channels in your DB)")
+
+        st.caption(
+            "This trains a channel-aware model on ALL channels stored in your local SQLite DB. "
+            "Target = log1p( views / channel_rolling_avg_views ). Predictions map back to expected views via baseline × ratio."
+        )
+
+        col1, col2, col3 = st.columns([1.1, 1.3, 1.6])
+        baseline_n = col1.slider("Baseline window (N previous videos)", 5, 30, 10)
+        use_post = col2.checkbox(
+            "Use post-publish features (likes/comments ratios)",
+            value=False,
+            help="Turn ON only if you are predicting views after a video has already had time to collect engagement. "
+                 "For true pre-publish prediction, leave this OFF."
+        )
+        train_btn = col3.button("Train / Refresh global model", type="primary")
+
+        if train_btn:
+            with st.spinner("Loading all videos from DB and training..."):
+                all_videos = load_all_videos_df()
+                if all_videos.empty:
+                    st.error("No videos found in DB yet. Analyze at least one channel first.")
+                else:
+                    feat = build_feature_frame(all_videos, baseline_n=baseline_n)
+                    if len(feat) < 200:
+                        st.warning(
+                            f"Only {len(feat)} training rows after baseline filtering. "
+                            "More channels/videos will improve accuracy."
+                        )
+
+                    result = train_view_model(
+                        feat,
+                        use_post_publish_features=use_post,
+                        test_frac_per_channel=0.2,
+                        random_state=42,
+                    )
+
+                    st.session_state["view_model"] = result.model
+                    st.session_state["view_model_feats"] = result.feature_names
+                    st.session_state["view_model_baseline_n"] = baseline_n
+                    st.session_state["view_model_use_post"] = use_post
+                    st.session_state["view_model_metrics"] = result.metrics
+                    st.session_state["view_model_perm"] = result.perm_importance
+
+        if "view_model_metrics" in st.session_state:
+            m = st.session_state["view_model_metrics"]
+            a, b, c, d = st.columns(4)
+            a.metric("Test rows", f"{int(m.get('test_rows', 0)):,}")
+            b.metric("MAE (views)", f"{m.get('MAE_views', float('nan')):,.0f}")
+            c.metric("MAPE (views)", f"{m.get('MAPE_views', float('nan'))*100:.1f}%")
+            d.metric("MAPE (ratio)", f"{m.get('MAPE_ratio', float('nan'))*100:.1f}%")
+
+            if st.session_state.get("view_model_perm") is not None:
+                st.markdown("### What the model is using (permutation importance)")
+                st.dataframe(st.session_state["view_model_perm"].head(15), use_container_width=True)
+
+        st.markdown("### Quick pre-publish estimate (for this channel)")
+
+        if "view_model" not in st.session_state:
+            st.info("Train the global model first.")
+        else:
+            # Context from the currently loaded channel
+            ctx = df.sort_values("published").rename(columns={"published": "published_at"})[
+                ["published_at", "views", "duration_sec", "title"]
+            ].copy()
+
+            bn = int(st.session_state.get("view_model_baseline_n", 10))
+            if len(ctx) < bn:
+                st.warning(f"This channel needs at least {bn} videos in DB for a stable baseline prediction.")
+            else:
+                planned_title = st.text_input("Planned title", value="My next video title")
+                planned_duration = st.number_input("Planned duration (seconds)", min_value=0.0, value=600.0, step=10.0)
+
+                pub_dt = st.date_input("Planned publish date (local)", value=pd.Timestamp.now().date())
+                pub_hr = st.slider("Planned publish hour (local)", 0, 23, 12)
+
+                planned_local = pd.Timestamp.combine(pub_dt, time(pub_hr))
+                planned_utc = planned_local.tz_localize(None).tz_localize("UTC")
+
+                baseline = float(ctx["views"].tail(bn).mean())
+                last_pub = pd.to_datetime(ctx["published_at"].iloc[-1], utc=True)
+                days_since = float(max((planned_utc - last_pub).total_seconds() / 86400.0, 0.0))
+
+                import numpy as np
+                row = {
+                    "log_duration": float(np.log1p(max(planned_duration, 0.0))),
+                    "title_len": float(len(planned_title)),
+                    "title_words": float(len(planned_title.split())),
+                    "published_hour": float(planned_utc.hour),
+                    "published_dow": float(planned_utc.dayofweek),
+                    "published_month": float(planned_utc.month),
+                    "days_since_upload": float(min(days_since, 365.0)),
+                    "ch_roll_avg_views": float(baseline),
+                    "ch_roll_med_views": float(ctx["views"].tail(bn).median()),
+                    "ch_roll_std_views": float(ctx["views"].tail(bn).std() if bn > 1 else 0.0),
+                    "ch_trend_slope": 0.0,
+                    "is_short": float(planned_duration <= 60),
+                    "like_ratio": 0.0,
+                    "comment_ratio": 0.0,
+                    "engagement": 0.0,
+                }
+
+                feats = st.session_state["view_model_feats"]
+                X = np.array([[float(row.get(f, 0.0)) for f in feats]], dtype=float)
+
+                model = st.session_state["view_model"]
+                pred_y = float(model.predict(X)[0])
+                pred_ratio = float(np.expm1(pred_y))
+                pred_views = float(max(0.0, baseline * pred_ratio))
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Baseline (avg last N)", f"{baseline:,.0f}")
+                c2.metric("Predicted ratio", f"{pred_ratio:.2f}×")
+                c3.metric("Predicted views", f"{pred_views:,.0f}")
+
+                st.caption("Pre-publish estimate: assumes typical CTR/retention for the channel.")
+
 
     # -----------------------------
     # Table tab
