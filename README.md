@@ -1,5 +1,5 @@
 # YouTube Channel Analyzer (Python • Streamlit • SQLite • ML)
-
+ChannelScope — YouTube Intelligence Platform
 A local YouTube analytics lab combining:
 
 - Incremental data ingestion (YouTube Data API v3)

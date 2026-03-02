@@ -13,3 +13,6 @@ __pycache__/
 
 # PyCharm
 .idea/
+
+#local saved models
+./models/best_view_model.joblib
