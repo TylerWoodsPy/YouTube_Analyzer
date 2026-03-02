@@ -1,106 +1,135 @@
-# YouTube Channel Analyzer (Python • Streamlit • SQLite • ML)
-ChannelScope — YouTube Intelligence Platform
-A local YouTube analytics lab combining:
+# ChannelScope — YouTube Intelligence Platform
+*(YouTube Channel Analyzer)*
 
-- Incremental data ingestion (YouTube Data API v3)
+A local YouTube analytics and machine learning lab combining:
+
+- Incremental YouTube Data API ingestion
 - Normalized SQLite analytics warehouse
-- Offline ML model training pipeline
-- Streamlit dashboard for interactive BI + prediction serving
-
-The architecture is intentionally separated into:
-
-Ingestion → Storage → Feature Engineering → Offline Model Training → Model Serving (Streamlit)
+- Batch harvesting from custom channel lists
+- Leakage-safe feature engineering
+- Offline model training & benchmarking
+- Streamlit dashboard for BI + model serving
 
 ---
 
-## 🔥 What’s New (Current Architecture)
+# 🏗 Architecture Overview
 
-The prediction system is now **decoupled from the Streamlit UI**.
+The system is intentionally structured like a miniature analytics stack:
 
-You now:
+Ingestion → Storage → Feature Engineering → Offline Training → Model Serving
 
-1. Train models offline using `train_models.py`
-2. Automatically compare candidate configurations
-3. Save the best model to disk
-4. Load that model inside Streamlit for prediction
-
-This prevents UI-coupled experimentation and allows proper ML iteration.
+Model experimentation is separated from the Streamlit UI.
 
 ---
 
-## 📦 Project Structure
+# 📁 Project Structure
 
 ```
 youtube_analyzer/
 │
 ├── app.py
-│   └── Streamlit dashboard (loads trained model bundle)
+│   └── Streamlit dashboard (loads saved model bundle)
+│
+├── harvest.py
+│   └── Batch ingestion from .txt channel list
 │
 ├── train_models.py
-│   └── Offline model comparison + selection
+│   └── Offline model comparison & selection
 │
 ├── model_views.py
 │   ├── Feature engineering
-│   ├── Channel-aware train/test splitting
-│   ├── Channel holdout generalization testing
-│   └── Permutation importance analysis
+│   ├── Channel-aware splitting
+│   ├── Channel holdout testing
+│   └── Permutation importance
 │
 ├── yt_api.py
-│   └── YouTube API ingestion layer
+│   └── YouTube API ingestion
 │
 ├── transform.py
 │   └── API → normalized dataframe transforms
 │
 ├── db.py
-│   └── SQLite schema, upserts, snapshots
+│   └── SQLite schema & upserts
 │
 ├── models/
 │   └── best_view_model.joblib (generated)
 │
-├── requirements.txt
-└── README.md
+├── channels.txt (user-created list)
+└── requirements.txt
 ```
 
 ---
 
-## 🧠 Modeling System
+# 🚀 Batch Harvesting
 
-### Target
+You can ingest many channels at once using a simple text file.
+
+Create `channels.txt`:
+
+```
+@veritasium
+@Kurzgesagt
+UCsooa4yRKGN_zEE8iknghZA
+```
+
+Then run:
+
+```
+python harvest.py channels.txt --mode incremental --max-videos 200
+```
+
+Options:
+
+- `--mode incremental` → stops when hitting known videos
+- `--mode full` → always pulls newest N videos
+- `--ttl-hours` → skip recently refreshed channels
+- `--force` → override TTL
+
+This updates:
+
+- channels table
+- videos table
+- snapshot history
+
+Snapshots power velocity and growth metrics.
+
+---
+
+# 🧠 Machine Learning System
+
+## Target
 
 Model predicts:
 
+```
 log1p( views / rolling_channel_baseline )
+```
 
-Then maps back to expected views via:
+Then maps back to:
 
+```
 predicted_views = baseline × predicted_ratio
+```
 
 This stabilizes cross-channel training.
 
 ---
 
-### Train/Test Split Modes
+## Train/Test Split Modes
 
-`per_channel_time`
-- Train on earlier videos from each channel
-- Test on later videos from same channels
-- Tests “future prediction”
+### per_channel_time
+- Train on earlier videos
+- Test on later videos
+- Tests future prediction
 
-`channel_holdout`
+### channel_holdout
 - Train on subset of channels
 - Test on unseen channels
 - Tests generalization across creators
 
 ---
 
-### Permutation Importance
-
-After training, permutation importance is computed on a subsample of the test set (if large enough).  
-If test data is too small, importance is safely skipped.
-
----
-
-## 🚀 Offline Model Training
+# 🏋 Offline Model Training
 
 Train and compare models:
 
@@ -108,29 +137,29 @@ Train and compare models:
 python train_models.py
 ```
 
-This will:
+This:
 
-- Load all videos from SQLite
-- Build feature frames
-- Evaluate candidate configurations
-- Compare MAE on test set
-- Save the best model to:
+- Loads all videos from SQLite
+- Builds feature frames
+- Evaluates candidate configurations
+- Compares MAE on test sets
+- Saves the best bundle to:
 
 ```
 models/best_view_model.joblib
 ```
 
-The saved bundle contains:
+Saved bundle contains:
 
 - model
 - feature_names
 - metrics
 - permutation_importance
-- training configuration
+- training config
 
 ---
 
-## 🖥 Streamlit Usage
+# 🖥 Streamlit Dashboard
 
 Run:
 
@@ -138,75 +167,64 @@ Run:
 streamlit run app.py
 ```
 
-In the Predict tab:
+Predict tab:
 
 1. Click **Load best saved model**
 2. View stored metrics
-3. Run pre-publish view estimates
+3. Run pre-publish predictions
 
-Streamlit does NOT retrain models by default.
+Streamlit does NOT retrain by default.
 
-There is an optional in-app training expander for quick testing, but serious experimentation should use `train_models.py`.
+An optional in-app training expander exists for quick testing only.
 
 ---
 
-## 📊 Current Feature Set
+# 📊 Feature Engineering
 
-Video-Level:
-- Duration (log)
+Video-level:
+
+- Log duration
 - Title length
 - Word count
-- Publish hour / day / month
+- Publish hour/day/month
 - Short-form indicator
 
-Channel-Level (shifted rolling):
+Channel-level (shifted rolling):
+
 - Rolling mean views
 - Rolling median views
 - Rolling std views
-- Upload cadence (days since last upload)
+- Upload cadence
 - Rolling trend slope
 
-Optional Post-Publish:
+Optional post-publish:
+
 - Like ratio
 - Comment ratio
 - Engagement rate
 
 ---
 
-## 🧪 Growth & Snapshot System
+# 📈 Growth & Snapshots
 
 - Snapshot table captures time-based metrics
-- Velocity computed from snapshot deltas
+- Velocity calculated via snapshot deltas
 - Outlier detection compares actual vs expected
-- Data quality card monitors snapshot coverage
+- Data quality diagnostics monitor coverage
 
 ---
 
-## 📈 Roadmap
-
-- Multi-model benchmarking (RandomForest, Ridge, etc.)
-- Channel clustering + archetype-specific models
-- Automated harvesting pipeline
-- Scheduled snapshot automation
-- Cloud deployment
-- CI/CD + experiment logging
-
----
-
-## 🛡 Design Philosophy
-
-This project is structured like a miniature analytics engineering stack:
+# 🎯 Design Philosophy
 
 - Warehouse-first modeling
-- Leakage-safe feature construction
-- Proper holdout generalization testing
-- Model serving separation
-- Reproducible offline experimentation
-
-It is intentionally built as a portfolio-quality ML + data engineering hybrid project.
+- Leakage-safe features
+- Proper holdout testing
+- Offline experiment workflow
+- Clean model serving separation
+- Portfolio-ready ML + data engineering hybrid
 
 ---
 
-## License
+# License
 
 MIT

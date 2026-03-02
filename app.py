@@ -14,6 +14,8 @@ from yt_api import (
 
 from transform import videos_to_rows
 
+from harvest import resolve_channel_id, harvest_one
+
 from model_views import build_feature_frame, train_view_model
 
 from db import (
@@ -43,6 +45,60 @@ with st.sidebar:
     granularity = st.selectbox("Time granularity", ["Daily", "Weekly", "Monthly"], index=1)
     overlays = st.multiselect("Overlays", ["Rolling average", "Linear regression"], default=["Rolling average"])
     rolling_window = st.slider("Rolling window (points)", 2, 20, 5)
+
+    st.divider()
+    st.subheader("Harvest (batch ingest)")
+    with st.expander("Harvest channels from a .txt list", expanded=False):
+        st.caption("Upload a plain text file (one channel per line). Supports UC... channel IDs, @handles, or names.")
+        up = st.file_uploader("Channel list (.txt)", type=["txt"], key="harvest_file")
+        ttl_h = st.number_input("Skip channels fetched within (hours)", min_value=0, max_value=168, value=12, step=1, key="harvest_ttl")
+        mode = st.selectbox("Mode", ["incremental", "full"], index=0, key="harvest_mode")
+        max_vids = st.number_input("Max videos per channel", min_value=1, max_value=50000, value=200, step=10, key="harvest_max_videos")
+        force = st.checkbox("Force refresh", value=False, key="harvest_force")
+        sleep_s = st.number_input("Sleep between channels (sec)", min_value=0.0, max_value=5.0, value=0.0, step=0.1, key="harvest_sleep")
+
+        run = st.button("Run harvest", key="harvest_run")
+        if run:
+            if up is None:
+                st.error("Upload a .txt file first.")
+            else:
+                raw_text = up.getvalue().decode("utf-8", errors="replace")
+                # parse lines like harvest.parse_channel_list does
+                tokens = []
+                for line in raw_text.splitlines():
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    if " #" in s:
+                        s = s.split(" #", 1)[0].strip()
+                    tokens.append(s)
+
+                if not tokens:
+                    st.error("No channels found in file (after removing blanks/comments).")
+                else:
+                    st.write(f"Channels in file: {len(tokens)}")
+                    prog = st.progress(0)
+                    log = []
+                    total_new = 0
+                    for i, tok in enumerate(tokens, start=1):
+                        try:
+                            cid = resolve_channel_id(tok)
+                            n_new, title = harvest_one(
+                                cid,
+                                max_videos=int(max_vids),
+                                ttl_hours=int(ttl_h),
+                                force=bool(force),
+                                mode=str(mode),
+                                sleep_seconds=float(sleep_s),
+                            )
+                            total_new += int(n_new)
+                            log.append(f"[{i}/{len(tokens)}] {title} ({cid}) -> +{n_new} videos")
+                        except Exception as e:
+                            log.append(f"[{i}/{len(tokens)}] ERROR {tok} -> {e}")
+                        prog.progress(int(i / len(tokens) * 100))
+
+                    st.success(f"Harvest complete. Total new videos ingested: {total_new}")
+                    st.text("\n".join(log[-50:]))
 
 # -----------------------------
 # Top controls

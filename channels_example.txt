@@ -1,0 +1,10 @@
+# channels.txt
+# One channel per line.
+# Supports:
+#  - Channel IDs (UC...)
+#  - Handles (@handle)
+#  - Channel names (search query)
+#
+# Examples:
+@FalseSymmetry
+@WelsknightGaming
