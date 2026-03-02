@@ -1,67 +1,427 @@
+"""
+train_models_dual.py
+
+Offline model benchmarking + hyperparameter tuning that produces TWO best models:
+
+- models/best_per_channel.joblib       (split=per_channel_time)
+- models/best_channel_holdout.joblib   (split=channel_holdout)
+
+Also writes leaderboards:
+- runs/<timestamp>_per_channel_time.csv
+- runs/<timestamp>_channel_holdout.csv
+
+Each saved bundle includes baseline context so you can compare MAE to baselines:
+- mean_baseline_views
+- median_baseline_views
+- mae_over_mean_baseline
+
+Run:
+  python train_models_dual.py --trials 50 --baseline-n 10 15
+  python train_models_dual.py --trials 100 --baseline-n 10 15 20 --use-post
+"""
+
+from __future__ import annotations
+
+import argparse
 import os
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
 import joblib
 import numpy as np
+import pandas as pd
+
+from sklearn.base import RegressorMixin
+from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor, HistGradientBoostingRegressor
+from sklearn.inspection import permutation_importance
+from sklearn.linear_model import Ridge, ElasticNet
+from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
+from sklearn.model_selection import train_test_split
 
 from db import load_all_videos_df
-from model_views import build_feature_frame, train_view_model
+from model_views import build_feature_frame
 
-OUT_PATH = os.path.join("models", "best_view_model.joblib")
+
+def now_tag() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def log_uniform(rng: np.random.Generator, lo: float, hi: float) -> float:
+    return float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+
+
+def clip_ratio(r: np.ndarray, lo: float = 0.0, hi: float = 50.0) -> np.ndarray:
+    return np.clip(r, lo, hi)
+
+
+def safe_mape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(mean_absolute_percentage_error(np.maximum(y_true, 1.0), np.maximum(y_pred, 1.0)))
+
+
+def get_feature_list(use_post: bool) -> List[str]:
+    base_feats = [
+        "log_duration", "title_len", "title_words",
+        "published_hour", "published_dow", "published_month",
+        "days_since_upload",
+        "ch_roll_avg_views", "ch_roll_med_views", "ch_roll_std_views",
+        "ch_trend_slope",
+        "is_short",
+    ]
+    post_feats = ["like_ratio", "comment_ratio", "engagement"]
+    return base_feats + (post_feats if use_post else [])
+
+
+def split_train_test(
+    df: pd.DataFrame,
+    split_mode: str,
+    test_frac_per_channel: float,
+    channel_test_frac: float,
+    seed: int,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if split_mode == "channel_holdout":
+        channels = df["channel_id"].dropna().unique().tolist()
+        if len(channels) < 2:
+            raise ValueError("Need at least 2 channels for channel_holdout split.")
+        train_ch, test_ch = train_test_split(channels, test_size=channel_test_frac, random_state=seed)
+        return df[df["channel_id"].isin(train_ch)].copy(), df[df["channel_id"].isin(test_ch)].copy()
+
+    # per_channel_time
+    d = df.copy()
+    d["row_in_channel"] = d.groupby("channel_id").cumcount()
+    d["n_in_channel"] = d.groupby("channel_id")["views"].transform("count")
+    denom = (d["n_in_channel"] - 1).replace(0, np.nan)
+    d["pct_in_channel"] = d["row_in_channel"] / denom
+    is_test = d["pct_in_channel"] >= (1.0 - test_frac_per_channel)
+    return d[~is_test].copy(), d[is_test].copy()
+
+
+@dataclass
+class BestTrial:
+    model_name: str
+    params: Dict[str, Any]
+    baseline_n: int
+    use_post: bool
+    split_mode: str
+    seed: int
+    feature_names: List[str]
+    metrics: Dict[str, float]
+    model: RegressorMixin
+    perm_importance: Optional[pd.DataFrame]
+
+
+# ---- Model samplers (sklearn-only)
+def sample_hgbr(rng: np.random.Generator, seed: int) -> Tuple[str, RegressorMixin, Dict[str, Any]]:
+    params = {
+        "learning_rate": log_uniform(rng, 0.01, 0.2),
+        "max_depth": int(rng.integers(3, 11)),
+        "max_iter": int(rng.integers(200, 1501)),
+        "min_samples_leaf": int(rng.integers(10, 201)),
+        "l2_regularization": float(rng.uniform(0.0, 2.0)),
+        "random_state": seed,
+    }
+    return "HistGBR", HistGradientBoostingRegressor(**params), params
+
+
+def sample_rf(rng: np.random.Generator, seed: int, n_jobs: int) -> Tuple[str, RegressorMixin, Dict[str, Any]]:
+    max_depth = rng.choice([None] + list(range(6, 31)))
+    params = {
+        "n_estimators": int(rng.integers(200, 1201)),
+        "max_depth": max_depth,
+        "min_samples_leaf": int(rng.integers(1, 21)),
+        "max_features": rng.choice(["sqrt", 0.3, 0.5, 0.8]),
+        "n_jobs": n_jobs,
+        "random_state": seed,
+    }
+    return "RandomForest", RandomForestRegressor(**params), params
+
+
+def sample_et(rng: np.random.Generator, seed: int, n_jobs: int) -> Tuple[str, RegressorMixin, Dict[str, Any]]:
+    max_depth = rng.choice([None] + list(range(6, 31)))
+    params = {
+        "n_estimators": int(rng.integers(300, 1601)),
+        "max_depth": max_depth,
+        "min_samples_leaf": int(rng.integers(1, 21)),
+        "max_features": rng.choice(["sqrt", 0.3, 0.5, 0.8]),
+        "n_jobs": n_jobs,
+        "random_state": seed,
+    }
+    return "ExtraTrees", ExtraTreesRegressor(**params), params
+
+
+def sample_ridge(rng: np.random.Generator, seed: int) -> Tuple[str, RegressorMixin, Dict[str, Any]]:
+    alpha = log_uniform(rng, 0.1, 200.0)
+    return "Ridge", Ridge(alpha=alpha), {"alpha": alpha}
+
+
+def sample_enet(rng: np.random.Generator, seed: int) -> Tuple[str, RegressorMixin, Dict[str, Any]]:
+    params = {
+        "alpha": log_uniform(rng, 1e-4, 5.0),
+        "l1_ratio": float(rng.uniform(0.05, 0.95)),
+        "max_iter": 5000,
+        "random_state": seed,
+    }
+    return "ElasticNet", ElasticNet(**params), params
+
+
+def fit_score_one(
+    feature_df: pd.DataFrame,
+    model: RegressorMixin,
+    feats: List[str],
+    split_mode: str,
+    test_frac_per_channel: float,
+    channel_test_frac: float,
+    seed: int,
+    perm_repeats: int,
+    perm_max_rows: int,
+    ratio_clip_hi: float,
+) -> Tuple[Dict[str, float], Optional[pd.DataFrame]]:
+    df = feature_df.copy().sort_values(["channel_id", "published_at"]).reset_index(drop=True)
+    train, test = split_train_test(df, split_mode, test_frac_per_channel, channel_test_frac, seed)
+
+    if train.empty or test.empty:
+        raise ValueError(f"Empty split: train={len(train)} test={len(test)} (mode={split_mode})")
+
+    X_train = train[feats].fillna(0.0).to_numpy(dtype=float)
+    y_train = train["y"].to_numpy(dtype=float)
+    X_test = test[feats].fillna(0.0).to_numpy(dtype=float)
+    y_test = test["y"].to_numpy(dtype=float)
+
+    model.fit(X_train, y_train)
+    yhat = model.predict(X_test)
+
+    pr_true = np.expm1(y_test)
+    pr_pred = clip_ratio(np.expm1(yhat), 0.0, ratio_clip_hi)
+
+    v_true = test["views"].to_numpy(dtype=float)
+    baseline = test["baseline_views"].to_numpy(dtype=float)
+    v_pred = np.clip(baseline * pr_pred, 0, None)
+
+    mae_views = float(mean_absolute_error(v_true, v_pred))
+    mape_views = safe_mape(v_true, v_pred)
+
+    mean_baseline = float(np.nanmean(baseline))
+    median_baseline = float(np.nanmedian(baseline))
+    mae_over_mean_baseline = float(mae_views / mean_baseline) if mean_baseline > 0 else float("nan")
+
+    metrics: Dict[str, float] = {
+        "MAE_views": mae_views,
+        "MAPE_views": mape_views,
+        "MAE_ratio": float(mean_absolute_error(pr_true, pr_pred)),
+        "MAPE_ratio": float(mean_absolute_percentage_error(np.maximum(pr_true, 1e-6), np.maximum(pr_pred, 1e-6))),
+        "test_rows": float(len(test)),
+        "train_channels": float(train["channel_id"].nunique()),
+        "test_channels": float(test["channel_id"].nunique()),
+        "mean_views_test": float(np.nanmean(v_true)),
+        "median_views_test": float(np.nanmedian(v_true)),
+        "mean_baseline_views": mean_baseline,
+        "median_baseline_views": median_baseline,
+        "mae_over_mean_baseline": mae_over_mean_baseline,
+    }
+
+    perm_df: Optional[pd.DataFrame] = None
+    try:
+        n_test = len(test)
+        sample_n = int(min(perm_max_rows, n_test))
+        if sample_n >= 200:
+            idx = np.linspace(0, n_test - 1, sample_n).astype(int)
+            r = permutation_importance(
+                model,
+                X_test[idx],
+                y_test[idx],
+                n_repeats=perm_repeats,
+                random_state=seed,
+            )
+            perm_df = (
+                pd.DataFrame({"feature": feats, "importance_mean": r.importances_mean})
+                .sort_values("importance_mean", ascending=False)
+                .reset_index(drop=True)
+            )
+    except Exception:
+        perm_df = None
+
+    return metrics, perm_df
+
+
+def tune_for_split(
+    all_videos: pd.DataFrame,
+    split_mode: str,
+    trials: int,
+    baseline_ns: List[int],
+    use_post: bool,
+    seed: int,
+    test_frac_per_channel: float,
+    channel_test_frac: float,
+    perm_repeats: int,
+    perm_max_rows: int,
+    ratio_clip_hi: float,
+    metric: str,
+    n_jobs: int,
+    rng: np.random.Generator,
+) -> Tuple[pd.DataFrame, Optional[BestTrial], float]:
+    rows: List[Dict[str, Any]] = []
+    best: Optional[BestTrial] = None
+    best_score = float("inf")
+
+    samplers = [
+        lambda: sample_hgbr(rng, seed),
+        lambda: sample_rf(rng, seed, n_jobs),
+        lambda: sample_et(rng, seed, n_jobs),
+        lambda: sample_ridge(rng, seed),
+        lambda: sample_enet(rng, seed),
+    ]
+
+    trial_id = 0
+    for baseline_n in baseline_ns:
+        feat_df = build_feature_frame(all_videos, baseline_n=baseline_n)
+        feats = get_feature_list(use_post=use_post)
+
+        for _ in range(trials * len(samplers)):
+            trial_id += 1
+            model_name, model, params = samplers[trial_id % len(samplers)]()
+
+            try:
+                metrics_d, perm_df = fit_score_one(
+                    feature_df=feat_df,
+                    model=model,
+                    feats=feats,
+                    split_mode=split_mode,
+                    test_frac_per_channel=test_frac_per_channel,
+                    channel_test_frac=channel_test_frac,
+                    seed=seed,
+                    perm_repeats=perm_repeats,
+                    perm_max_rows=perm_max_rows,
+                    ratio_clip_hi=ratio_clip_hi,
+                )
+                score = float(metrics_d.get(metric, float("inf")))
+                ok = 1
+                err = ""
+            except Exception as e:
+                metrics_d = {}
+                perm_df = None
+                score = float("nan")
+                ok = 0
+                err = str(e)
+
+            rows.append({
+                "ok": ok,
+                "error": err,
+                "trial": trial_id,
+                "model": model_name,
+                "baseline_n": baseline_n,
+                "use_post": int(use_post),
+                "split_mode": split_mode,
+                "metric_used": metric,
+                "score": score,
+                **metrics_d,
+                "params": str(params),
+            })
+
+            if ok and score < best_score:
+                best_score = score
+                best = BestTrial(
+                    model_name=model_name,
+                    params=params,
+                    baseline_n=baseline_n,
+                    use_post=use_post,
+                    split_mode=split_mode,
+                    seed=seed,
+                    feature_names=feats,
+                    metrics={"split_mode": split_mode, **metrics_d},
+                    model=model,
+                    perm_importance=perm_df,
+                )
+
+    df_out = pd.DataFrame(rows).sort_values(["ok", "score"], ascending=[False, True]).reset_index(drop=True)
+    return df_out, best, best_score
+
+
+def save_bundle(best: BestTrial, out_path: str, metric: str, best_score: float, ratio_clip_hi: float) -> None:
+    bundle = {
+        "model": best.model,
+        "feature_names": best.feature_names,
+        "metrics": best.metrics,
+        "perm_importance": best.perm_importance,
+        "config": {
+            "model": best.model_name,
+            "params": best.params,
+            "baseline_n": best.baseline_n,
+            "use_post": best.use_post,
+            "split_mode": best.split_mode,
+            "seed": best.seed,
+            "metric": metric,
+            "ratio_clip_hi": ratio_clip_hi,
+        },
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    joblib.dump(bundle, out_path)
 
 
 def main():
-    os.makedirs("models", exist_ok=True)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--trials", type=int, default=50, help="Trials per model family, per baseline_n.")
+    ap.add_argument("--baseline-n", type=int, nargs="+", default=[10, 15], help="Baseline windows to try.")
+    ap.add_argument("--use-post", action="store_true", help="Include post-publish features.")
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--test-frac-per-channel", type=float, default=0.2)
+    ap.add_argument("--channel-test-frac", type=float, default=0.2)
+    ap.add_argument("--perm-repeats", type=int, default=8)
+    ap.add_argument("--perm-max-rows", type=int, default=2000)
+    ap.add_argument("--ratio-clip-hi", type=float, default=50.0)
+    ap.add_argument("--metric", choices=["MAE_views", "MAPE_views"], default="MAE_views")
+    ap.add_argument("--n-jobs", type=int, default=-1)
+    args = ap.parse_args()
 
+    os.makedirs("models", exist_ok=True)
+    os.makedirs("runs", exist_ok=True)
+
+    print("Loading all videos from DB...")
     all_videos = load_all_videos_df()
     if all_videos.empty:
-        raise SystemExit("No videos found in DB. Analyze at least one channel first.")
+        raise SystemExit("No videos found in DB yet. Harvest/analyze at least one channel first.")
 
-    # You can grid this later; start simple:
-    candidates = [
-        {"baseline_n": 10, "use_post": False, "split_mode": "per_channel_time", "channel_test_frac": 0.2},
-        {"baseline_n": 10, "use_post": False, "split_mode": "channel_holdout", "channel_test_frac": 0.2},
-        {"baseline_n": 15, "use_post": False, "split_mode": "per_channel_time", "channel_test_frac": 0.2},
-        {"baseline_n": 15, "use_post": False, "split_mode": "channel_holdout", "channel_test_frac": 0.2},
-    ]
+    rng = np.random.default_rng(args.seed)
+    run_id = now_tag()
 
-    best = None
-    best_score = np.inf  # lower is better (MAE_views)
-
-    for cfg in candidates:
-        feat = build_feature_frame(all_videos, baseline_n=cfg["baseline_n"])
-
-        result = train_view_model(
-            feat,
-            use_post_publish_features=cfg["use_post"],
-            test_frac_per_channel=0.2,
-            channel_test_frac=cfg["channel_test_frac"],
-            split_mode=cfg["split_mode"],
-            random_state=42,
+    for split_mode, out_model, out_csv in [
+        ("per_channel_time", os.path.join("models", "best_per_channel.joblib"), os.path.join("runs", f"{run_id}_per_channel_time.csv")),
+        ("channel_holdout", os.path.join("models", "best_channel_holdout.joblib"), os.path.join("runs", f"{run_id}_channel_holdout.csv")),
+    ]:
+        print(f"\n=== Tuning split_mode={split_mode} ===")
+        df_out, best, best_score = tune_for_split(
+            all_videos=all_videos,
+            split_mode=split_mode,
+            trials=args.trials,
+            baseline_ns=args.baseline_n,
+            use_post=args.use_post,
+            seed=args.seed,
+            test_frac_per_channel=args.test_frac_per_channel,
+            channel_test_frac=args.channel_test_frac,
+            perm_repeats=args.perm_repeats,
+            perm_max_rows=args.perm_max_rows,
+            ratio_clip_hi=args.ratio_clip_hi,
+            metric=args.metric,
+            n_jobs=args.n_jobs,
+            rng=rng,
         )
 
-        score = float(result.metrics.get("MAE_views", np.inf))
-        print(f"{cfg} -> MAE_views={score:,.0f} | test_rows={result.metrics.get('test_rows')}")
+        df_out.to_csv(out_csv, index=False)
+        print(f"Wrote leaderboard: {out_csv}")
 
-        if score < best_score:
-            best_score = score
-            best = (cfg, result)
+        if best is None:
+            print("No successful trials for this split.")
+            continue
 
-    if best is None:
-        raise SystemExit("No model trained successfully.")
+        save_bundle(best, out_model, args.metric, best_score, args.ratio_clip_hi)
+        m = best.metrics
+        print(f"Saved best model: {out_model}")
+        print(f"Best: {best.model_name} baseline_n={best.baseline_n} use_post={best.use_post} "
+              f"{args.metric}={best_score:,.2f}")
+        print(f"Test mean views: {m.get('mean_views_test', float('nan')):,.0f} | "
+              f"mean baseline: {m.get('mean_baseline_views', float('nan')):,.0f} | "
+              f"MAE/mean baseline: {m.get('mae_over_mean_baseline', float('nan')):.2f}×")
 
-    cfg, result = best
-
-    bundle = {
-        "model": result.model,
-        "feature_names": result.feature_names,
-        "metrics": result.metrics,
-        "perm_importance": result.perm_importance,
-        "config": cfg,
-    }
-
-    joblib.dump(bundle, OUT_PATH)
-    print(f"\nSaved best model to: {OUT_PATH}")
-    print(f"Best config: {cfg}")
-    print(f"Best MAE_views: {best_score:,.0f}")
+    print("\nDone.")
 
 
 if __name__ == "__main__":

@@ -6,5 +6,10 @@
 #  - Channel names (search query)
 #
 # Examples:
-@FalseSymmetry
+@xBCrafted
 @WelsknightGaming
+@impulseSV
+@iJevin
+@GeminiTayMC
+@ZombieCleo
+@SmallishBeans

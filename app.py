@@ -29,13 +29,14 @@ from db import (
     load_snapshot_deltas_df,
 )
 
-from datetime import datetime, timedelta, timezone, time
+from datetime import datetime, timedelta, timezone
 
 st.set_page_config(page_title="YouTube Channel Analyzer", layout="wide")
 st.title("📊 YouTube Channel Analyzer")
 
 # Path for offline-trained model bundle (trained via train_models.py)
-MODEL_PATH = os.path.join("models", "best_view_model.joblib")
+MODEL_PATH_PER = os.path.join("models", "best_per_channel.joblib")
+MODEL_PATH_HOLD = os.path.join("models", "best_channel_holdout.joblib")
 
 # -----------------------------
 # Sidebar: chart options
@@ -344,77 +345,97 @@ if "df" in st.session_state:
     # Predict tab
     # -----------------------------
     with tab_predict:
-        st.subheader("Predict Views (offline-trained global model)")
+        st.subheader("Predict Views (offline-trained models)")
 
         st.caption(
-            "This tab is designed to *load* a model you trained separately (offline) from your SQLite DB. "
-            "Train models with: `python train_models.py` (saves to models/best_view_model.joblib)."
+            "Train models offline, then load them here.\n"
+            "This app supports two saved models:\n"
+            "• per_channel_time (predict future videos for known channels)\n"
+            "• channel_holdout (generalize to unseen channels)\n\n"
+            "Run: python train_models.py"
         )
 
-        c1, c2 = st.columns([1.2, 2.2])
+        c1, c2, c3 = st.columns([1.2, 1.2, 2.0])
         with c1:
-            load_btn = st.button("Load best saved model", type="primary")
+            load_btn = st.button("Load saved models", type="primary")
         with c2:
-            st.code(MODEL_PATH, language="text")
+            which = st.selectbox(
+                "Active model",
+                ["per_channel_time", "channel_holdout"],
+                index=0,
+                key="active_model_key",
+                help="Switch between the two offline-trained models."
+            )
+        with c3:
+            st.code(f"{MODEL_PATH_PER}\n{MODEL_PATH_HOLD}", language="text")
 
         if load_btn:
-            if not os.path.exists(MODEL_PATH):
-                st.error(f"No saved model found at: {MODEL_PATH}\nRun: python train_models.py")
+            loaded = 0
+
+            if os.path.exists(MODEL_PATH_PER):
+                b = joblib.load(MODEL_PATH_PER)
+                st.session_state["models_per_channel"] = b
+                loaded += 1
             else:
-                bundle = joblib.load(MODEL_PATH)
-                st.session_state["view_model"] = bundle["model"]
-                st.session_state["view_model_feats"] = bundle.get("feature_names", [])
-                st.session_state["view_model_metrics"] = bundle.get("metrics", {})
-                st.session_state["view_model_perm"] = bundle.get("perm_importance", None)
+                st.warning(f"Missing: {MODEL_PATH_PER}")
 
-                cfg = bundle.get("config", {}) or {}
-                st.session_state["view_model_baseline_n"] = int(cfg.get("baseline_n", 10))
-                st.session_state["view_model_use_post"] = bool(cfg.get("use_post", False))
-                st.session_state["view_model_config"] = cfg
+            if os.path.exists(MODEL_PATH_HOLD):
+                b = joblib.load(MODEL_PATH_HOLD)
+                st.session_state["models_channel_holdout"] = b
+                loaded += 1
+            else:
+                st.warning(f"Missing: {MODEL_PATH_HOLD}")
 
-                st.success("Loaded best saved model.")
+            if loaded:
+                st.success(f"Loaded {loaded} model bundle(s).")
 
-        # Show metrics if present
-        if "view_model_metrics" in st.session_state and st.session_state["view_model_metrics"]:
-            m = st.session_state["view_model_metrics"]
-            a, b, c, d = st.columns(4)
-            a.metric("Test rows", f"{int(m.get('test_rows', 0)):,}")
-            b.metric("MAE (views)", f"{m.get('MAE_views', float('nan')):,.0f}")
-            c.metric("MAPE (views)", f"{m.get('MAPE_views', float('nan'))*100:.1f}%")
-            d.metric("Split mode", str(m.get("split_mode", "—")))
+        # Pick the active bundle
+        bundle_key = "models_per_channel" if which == "per_channel_time" else "models_channel_holdout"
+        bundle = st.session_state.get(bundle_key)
 
-            cfg = st.session_state.get("view_model_config", {})
-            if cfg:
-                st.caption(f"Loaded config: {cfg}")
-
-            if st.session_state.get("view_model_perm") is not None:
-                st.markdown("### What the model is using (permutation importance)")
-                st.dataframe(st.session_state["view_model_perm"].head(15), use_container_width=True)
-
-        st.markdown("### Quick pre-publish estimate (for this channel)")
-
-        if "view_model" not in st.session_state:
-            st.info("Load the saved model first.")
+        if bundle is None:
+            st.info("Load the saved models first (button above).")
         else:
+            model = bundle["model"]
+            feats = bundle.get("feature_names", [])
+            metrics = bundle.get("metrics", {}) or {}
+            cfg = bundle.get("config", {}) or {}
+
+            # Summary cards
+            a, b, c, d = st.columns(4)
+            a.metric("MAE (views)", f"{float(metrics.get('MAE_views', float('nan'))):,.0f}")
+            b.metric("Test rows", f"{int(metrics.get('test_rows', 0)):,}")
+            c.metric("Mean baseline", f"{float(metrics.get('mean_baseline_views', float('nan'))):,.0f}")
+            d.metric("MAE / mean baseline", f"{float(metrics.get('mae_over_mean_baseline', float('nan'))):.2f}×")
+
+            st.caption(f"Active: **{which}** | baseline_n={cfg.get('baseline_n')} | model={cfg.get('model', cfg.get('model_name', '—'))}")
+
+            if bundle.get("perm_importance") is not None:
+                st.markdown("### What the model is using (permutation importance)")
+                st.dataframe(bundle["perm_importance"].head(15), use_container_width=True)
+
+            st.markdown("### Quick pre-publish estimate (for this channel)")
+
+            import numpy as np
+            from datetime import time
+
             # Context from the currently loaded channel
             ctx = df.sort_values("published").rename(columns={"published": "published_at"})[
                 ["published_at", "views", "duration_sec", "title"]
             ].copy()
 
-            import numpy as np
-
-            bn = int(st.session_state.get("view_model_baseline_n", 10))
+            bn = int(cfg.get("baseline_n", 10) or 10)
             if len(ctx) < bn:
                 st.warning(f"This channel needs at least {bn} videos in DB for a stable baseline prediction.")
             else:
-                planned_title = st.text_input("Planned title", value="My next video title")
-                planned_duration = st.number_input("Planned duration (seconds)", min_value=0.0, value=600.0, step=10.0)
+                planned_title = st.text_input("Planned title", value="My next video title", key=f"title_{which}")
+                planned_duration = st.number_input("Planned duration (seconds)", min_value=0.0, value=600.0, step=10.0, key=f"dur_{which}")
 
-                pub_dt = st.date_input("Planned publish date (local)", value=pd.Timestamp.now().date())
-                pub_hr = st.slider("Planned publish hour (local)", 0, 23, 12)
+                pub_dt = st.date_input("Planned publish date (local)", value=pd.Timestamp.now().date(), key=f"date_{which}")
+                pub_hr = st.slider("Planned publish hour (local)", 0, 23, 12, key=f"hr_{which}")
 
                 planned_local = pd.Timestamp.combine(pub_dt, time(pub_hr))
-                planned_utc = planned_local.tz_localize(None).tz_localize("UTC")
+                planned_utc = planned_local.tz_localize("UTC") if planned_local.tzinfo is None else planned_local.tz_convert("UTC")
 
                 baseline = float(ctx["views"].tail(bn).mean())
                 last_pub = pd.to_datetime(ctx["published_at"].iloc[-1], utc=True)
@@ -439,10 +460,8 @@ if "df" in st.session_state:
                     "engagement": 0.0,
                 }
 
-                feats = st.session_state.get("view_model_feats", [])
                 X = np.array([[float(row.get(f, 0.0)) for f in feats]], dtype=float)
 
-                model = st.session_state["view_model"]
                 pred_y = float(model.predict(X)[0])
                 pred_ratio = float(np.expm1(pred_y))
                 pred_views = float(max(0.0, baseline * pred_ratio))

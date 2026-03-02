@@ -15,4 +15,7 @@ __pycache__/
 .idea/
 
 #local saved models
-models/best_view_model.joblib
+models/
+
+#local saved csvs
+runs/
