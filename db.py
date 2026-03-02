@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timezone
 from typing import Iterable, Dict, Any, Optional
+import pandas as pd
 
 DB = "yt_analytics.db"
 
@@ -129,7 +130,6 @@ def upsert_videos(channel_id: str, video_rows: Iterable[Dict[str, Any]], db_path
 
 
 def load_videos_df(channel_id: str, db_path: str = DB):
-    import pandas as pd
     init_db(db_path)
     with sqlite3.connect(db_path) as conn:
         df = pd.read_sql_query(
@@ -168,7 +168,6 @@ def load_snapshot_deltas_df(channel_id: str, db_path: str = DB):
     Returns per-video latest delta and velocity based on last two snapshots.
     Columns: video_id, snapshot_at_utc, views, prev_views, views_delta, days_delta, views_per_day
     """
-    import pandas as pd
     init_db(db_path)
 
     q = """
@@ -213,7 +212,6 @@ def load_snapshot_deltas_df(channel_id: str, db_path: str = DB):
 
 def load_all_videos_df(db_path: str = DB):
     """Load ALL videos across all channels."""
-    import pandas as pd
     init_db(db_path)
     with sqlite3.connect(db_path) as conn:
         df = pd.read_sql_query(
@@ -226,7 +224,6 @@ def load_all_videos_df(db_path: str = DB):
 
 def load_channels_df(db_path: str = DB):
     """Load channel-level stats."""
-    import pandas as pd
     init_db(db_path)
     with sqlite3.connect(db_path) as conn:
         df = pd.read_sql_query(
