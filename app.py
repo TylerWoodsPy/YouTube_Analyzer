@@ -4,6 +4,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import pandas as pd
 import joblib
+import numpy as np
 
 from yt_api import (
     get_channel_id,
@@ -29,7 +30,7 @@ from db import (
     load_snapshot_deltas_df,
 )
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time
 
 st.set_page_config(page_title="YouTube Channel Analyzer", layout="wide")
 st.title("📊 YouTube Channel Analyzer")
@@ -416,8 +417,6 @@ if "df" in st.session_state:
 
             st.markdown("### Quick pre-publish estimate (for this channel)")
 
-            import numpy as np
-            from datetime import time
 
             # Context from the currently loaded channel
             ctx = df.sort_values("published").rename(columns={"published": "published_at"})[
@@ -568,7 +567,6 @@ if "df" in st.session_state:
     with tab_outliers:
         st.subheader("Winners & Outliers (Expected vs Actual)")
 
-        import numpy as np
 
         # ---- Controls
         colA, colB, colC = st.columns(3)

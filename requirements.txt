@@ -6,3 +6,4 @@ python-dotenv
 isodate
 scikit-learn
 joblib
+numpy
