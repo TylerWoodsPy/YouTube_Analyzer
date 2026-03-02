@@ -1,7 +1,9 @@
+import os
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 import pandas as pd
+import joblib
 
 from yt_api import (
     get_channel_id,
@@ -29,6 +31,9 @@ from datetime import datetime, timedelta, timezone, time
 
 st.set_page_config(page_title="YouTube Channel Analyzer", layout="wide")
 st.title("📊 YouTube Channel Analyzer")
+
+# Path for offline-trained model bundle (trained via train_models.py)
+MODEL_PATH = os.path.join("models", "best_view_model.joblib")
 
 # -----------------------------
 # Sidebar: chart options
@@ -279,62 +284,52 @@ if "df" in st.session_state:
         )
         st.plotly_chart(fig_sc2, use_container_width=True)
 
-
     # -----------------------------
     # Predict tab
     # -----------------------------
     with tab_predict:
-        st.subheader("Predict Views (global model across all channels in your DB)")
+        st.subheader("Predict Views (offline-trained global model)")
 
         st.caption(
-            "This trains a channel-aware model on ALL channels stored in your local SQLite DB. "
-            "Target = log1p( views / channel_rolling_avg_views ). Predictions map back to expected views via baseline × ratio."
+            "This tab is designed to *load* a model you trained separately (offline) from your SQLite DB. "
+            "Train models with: `python train_models.py` (saves to models/best_view_model.joblib)."
         )
 
-        col1, col2, col3 = st.columns([1.1, 1.3, 1.6])
-        baseline_n = col1.slider("Baseline window (N previous videos)", 5, 30, 10)
-        use_post = col2.checkbox(
-            "Use post-publish features (likes/comments ratios)",
-            value=False,
-            help="Turn ON only if you are predicting views after a video has already had time to collect engagement. "
-                 "For true pre-publish prediction, leave this OFF."
-        )
-        train_btn = col3.button("Train / Refresh global model", type="primary")
+        c1, c2 = st.columns([1.2, 2.2])
+        with c1:
+            load_btn = st.button("Load best saved model", type="primary")
+        with c2:
+            st.code(MODEL_PATH, language="text")
 
-        if train_btn:
-            with st.spinner("Loading all videos from DB and training..."):
-                all_videos = load_all_videos_df()
-                if all_videos.empty:
-                    st.error("No videos found in DB yet. Analyze at least one channel first.")
-                else:
-                    feat = build_feature_frame(all_videos, baseline_n=baseline_n)
-                    if len(feat) < 200:
-                        st.warning(
-                            f"Only {len(feat)} training rows after baseline filtering. "
-                            "More channels/videos will improve accuracy."
-                        )
+        if load_btn:
+            if not os.path.exists(MODEL_PATH):
+                st.error(f"No saved model found at: {MODEL_PATH}\nRun: python train_models.py")
+            else:
+                bundle = joblib.load(MODEL_PATH)
+                st.session_state["view_model"] = bundle["model"]
+                st.session_state["view_model_feats"] = bundle.get("feature_names", [])
+                st.session_state["view_model_metrics"] = bundle.get("metrics", {})
+                st.session_state["view_model_perm"] = bundle.get("perm_importance", None)
 
-                    result = train_view_model(
-                        feat,
-                        use_post_publish_features=use_post,
-                        test_frac_per_channel=0.2,
-                        random_state=42,
-                    )
+                cfg = bundle.get("config", {}) or {}
+                st.session_state["view_model_baseline_n"] = int(cfg.get("baseline_n", 10))
+                st.session_state["view_model_use_post"] = bool(cfg.get("use_post", False))
+                st.session_state["view_model_config"] = cfg
 
-                    st.session_state["view_model"] = result.model
-                    st.session_state["view_model_feats"] = result.feature_names
-                    st.session_state["view_model_baseline_n"] = baseline_n
-                    st.session_state["view_model_use_post"] = use_post
-                    st.session_state["view_model_metrics"] = result.metrics
-                    st.session_state["view_model_perm"] = result.perm_importance
+                st.success("Loaded best saved model.")
 
-        if "view_model_metrics" in st.session_state:
+        # Show metrics if present
+        if "view_model_metrics" in st.session_state and st.session_state["view_model_metrics"]:
             m = st.session_state["view_model_metrics"]
             a, b, c, d = st.columns(4)
             a.metric("Test rows", f"{int(m.get('test_rows', 0)):,}")
             b.metric("MAE (views)", f"{m.get('MAE_views', float('nan')):,.0f}")
             c.metric("MAPE (views)", f"{m.get('MAPE_views', float('nan'))*100:.1f}%")
-            d.metric("MAPE (ratio)", f"{m.get('MAPE_ratio', float('nan'))*100:.1f}%")
+            d.metric("Split mode", str(m.get("split_mode", "—")))
+
+            cfg = st.session_state.get("view_model_config", {})
+            if cfg:
+                st.caption(f"Loaded config: {cfg}")
 
             if st.session_state.get("view_model_perm") is not None:
                 st.markdown("### What the model is using (permutation importance)")
@@ -343,12 +338,14 @@ if "df" in st.session_state:
         st.markdown("### Quick pre-publish estimate (for this channel)")
 
         if "view_model" not in st.session_state:
-            st.info("Train the global model first.")
+            st.info("Load the saved model first.")
         else:
             # Context from the currently loaded channel
             ctx = df.sort_values("published").rename(columns={"published": "published_at"})[
                 ["published_at", "views", "duration_sec", "title"]
             ].copy()
+
+            import numpy as np
 
             bn = int(st.session_state.get("view_model_baseline_n", 10))
             if len(ctx) < bn:
@@ -367,7 +364,6 @@ if "df" in st.session_state:
                 last_pub = pd.to_datetime(ctx["published_at"].iloc[-1], utc=True)
                 days_since = float(max((planned_utc - last_pub).total_seconds() / 86400.0, 0.0))
 
-                import numpy as np
                 row = {
                     "log_duration": float(np.log1p(max(planned_duration, 0.0))),
                     "title_len": float(len(planned_title)),
@@ -381,12 +377,13 @@ if "df" in st.session_state:
                     "ch_roll_std_views": float(ctx["views"].tail(bn).std() if bn > 1 else 0.0),
                     "ch_trend_slope": 0.0,
                     "is_short": float(planned_duration <= 60),
+                    # no post-publish info pre-upload
                     "like_ratio": 0.0,
                     "comment_ratio": 0.0,
                     "engagement": 0.0,
                 }
 
-                feats = st.session_state["view_model_feats"]
+                feats = st.session_state.get("view_model_feats", [])
                 X = np.array([[float(row.get(f, 0.0)) for f in feats]], dtype=float)
 
                 model = st.session_state["view_model"]
@@ -401,6 +398,71 @@ if "df" in st.session_state:
 
                 st.caption("Pre-publish estimate: assumes typical CTR/retention for the channel.")
 
+        with st.expander("Optional: Train inside Streamlit (not recommended for model development)", expanded=False):
+            st.warning(
+                "This is here only for convenience. For serious model work, use train_models.py "
+                "and load the saved model above."
+            )
+
+            col1, col2, col3 = st.columns([1.1, 1.3, 1.6])
+            baseline_n = col1.slider("Baseline window (N previous videos)", 5, 30, 10, key="inapp_baseline_n")
+            use_post = col2.checkbox(
+                "Use post-publish features (likes/comments ratios)",
+                value=False,
+                key="inapp_use_post",
+                help="Turn ON only if you are predicting views after a video has already had time to collect engagement. "
+                     "For true pre-publish prediction, leave this OFF."
+            )
+            train_btn = col3.button("Train / Refresh global model (in-app)", key="inapp_train_btn")
+
+            split_mode = st.selectbox(
+                "Train/test split",
+                ["per_channel_time", "channel_holdout"],
+                index=0,
+                key="inapp_split_mode",
+                help="per_channel_time = future videos on known channels. channel_holdout = generalize to unseen channels."
+            )
+
+            channel_test_frac = st.slider(
+                "Holdout channels fraction",
+                0.05, 0.50, 0.20, 0.05,
+                key="inapp_channel_test_frac",
+            )
+
+            if train_btn:
+                with st.spinner("Loading all videos from DB and training..."):
+                    all_videos = load_all_videos_df()
+                    if all_videos.empty:
+                        st.error("No videos found in DB yet. Analyze at least one channel first.")
+                    else:
+                        feat = build_feature_frame(all_videos, baseline_n=baseline_n)
+                        if len(feat) < 200:
+                            st.warning(
+                                f"Only {len(feat)} training rows after baseline filtering. "
+                                "More channels/videos will improve accuracy."
+                            )
+
+                        result = train_view_model(
+                            feat,
+                            use_post_publish_features=use_post,
+                            test_frac_per_channel=0.2,
+                            channel_test_frac=channel_test_frac,
+                            split_mode=split_mode,
+                            random_state=42,
+                        )
+
+                        st.session_state["view_model"] = result.model
+                        st.session_state["view_model_feats"] = result.feature_names
+                        st.session_state["view_model_baseline_n"] = baseline_n
+                        st.session_state["view_model_use_post"] = use_post
+                        st.session_state["view_model_metrics"] = result.metrics
+                        st.session_state["view_model_perm"] = result.perm_importance
+                        st.session_state["view_model_config"] = {
+                            "baseline_n": baseline_n,
+                            "use_post": use_post,
+                            "split_mode": split_mode,
+                            "channel_test_frac": channel_test_frac,
+                        }
 
     # -----------------------------
     # Table tab
@@ -424,6 +486,7 @@ if "df" in st.session_state:
             file_name="youtube_videos_filtered.csv",
             mime="text/csv"
         )
+
     # -----------------------------
     # Outliers tab
     # -----------------------------
@@ -449,7 +512,6 @@ if "df" in st.session_state:
         # Training set: either all videos or just the filtered slice
         train_df = df.copy() if train_on_all else df_filt.copy()
 
-
         # ---- Filters applied to BOTH sets
         def apply_filters(x: pd.DataFrame) -> pd.DataFrame:
             x = x.copy()
@@ -457,7 +519,6 @@ if "df" in st.session_state:
             if not include_shorts:
                 x = x[x["duration_sec"].fillna(0) > 60]
             return x
-
 
         train_df = apply_filters(train_df)
         score_df = apply_filters(score_df)
@@ -471,7 +532,6 @@ if "df" in st.session_state:
         else:
             now = pd.Timestamp.utcnow()
 
-
             def featurize(z: pd.DataFrame) -> pd.DataFrame:
                 z = z.copy()
 
@@ -484,7 +544,6 @@ if "df" in st.session_state:
                 # Engagement can be NA if views=0; ensure numeric
                 z["engagement"] = z["engagement"].astype(float).fillna(0.0).clip(lower=0.0)
                 return z
-
 
             train_df = featurize(train_df)
             score_df = featurize(score_df)
@@ -569,6 +628,7 @@ if "df" in st.session_state:
                 "Model is intentionally simple (age, duration, engagement). "
                 "Residuals are in log-space; positive = overperformed vs expectation."
             )
+
     # -----------------------------
     # Growth tab
     # -----------------------------
@@ -665,6 +725,7 @@ if "df" in st.session_state:
                 show_raw = st.checkbox("Show full delta table", value=False)
                 if show_raw:
                     st.dataframe(g.sort_values("snapshot_at_utc", ascending=False), use_container_width=True)
+
         # -----------------------------
         # Data quality / coverage card
         # -----------------------------
@@ -676,9 +737,6 @@ if "df" in st.session_state:
             # Basic coverage metrics
             videos_with_deltas = deltas["video_id"].nunique()
 
-            # Snapshot count per video (from raw snapshot table would be best,
-            # but we can estimate useful coverage from deltas: deltas imply 2+ snapshots)
-            # If you want true counts, we can query video_snapshots directly later.
             newest_delta_time = deltas["snapshot_at_utc"].max()
             oldest_delta_time = deltas["snapshot_at_utc"].min()
 
@@ -686,7 +744,6 @@ if "df" in st.session_state:
             gap_days = deltas["days_delta"].dropna()
             median_gap_hours = (gap_days.median() * 24) if not gap_days.empty else None
             min_gap_minutes = (gap_days.min() * 24 * 60) if not gap_days.empty else None
-            max_gap_days = gap_days.max() if not gap_days.empty else None
 
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Videos with 2+ snapshots", f"{videos_with_deltas:,}")

@@ -1,14 +1,16 @@
 # model_views.py
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
 from dataclasses import dataclass
 from typing import Dict, Optional, List
+
+import numpy as np
+import pandas as pd
 
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
+from sklearn.model_selection import train_test_split
 
 
 @dataclass
@@ -105,38 +107,61 @@ def train_view_model(
     feature_df: pd.DataFrame,
     use_post_publish_features: bool = True,
     test_frac_per_channel: float = 0.2,
+    channel_test_frac: float = 0.2,
+    split_mode: str = "per_channel_time",  # "per_channel_time" or "channel_holdout"
     random_state: int = 42,
+    perm_repeats: int = 8,
+    perm_max_rows: int = 2000,
 ) -> TrainResult:
     """
-    Train a model to predict log1p(perf_ratio). Convert back to views by baseline * expm1(pred).
-    Uses per-channel chronological split.
+    split_mode:
+      - "per_channel_time": chronological split inside each channel
+      - "channel_holdout": hold out entire channels for test
+
+    Notes:
+      - Permutation importance is computed on a subsample of the TEST set (when enough rows exist).
+      - If the test set is tiny, perm_importance will be None (to keep things stable/fast).
     """
     df = feature_df.copy().sort_values(["channel_id", "published_at"]).reset_index(drop=True)
 
-    df["row_in_channel"] = df.groupby("channel_id").cumcount()
-    df["n_in_channel"] = df.groupby("channel_id")["views"].transform("count")
-    df["pct_in_channel"] = df["row_in_channel"] / (df["n_in_channel"] - 1).replace(0, np.nan)
-    is_test = df["pct_in_channel"] >= (1.0 - test_frac_per_channel)
-
-    train = df[~is_test].copy()
-    test = df[is_test].copy()
-
     base_feats = [
-        "log_duration",
-        "title_len",
-        "title_words",
-        "published_hour",
-        "published_dow",
-        "published_month",
+        "log_duration", "title_len", "title_words",
+        "published_hour", "published_dow", "published_month",
         "days_since_upload",
-        "ch_roll_avg_views",
-        "ch_roll_med_views",
-        "ch_roll_std_views",
+        "ch_roll_avg_views", "ch_roll_med_views", "ch_roll_std_views",
         "ch_trend_slope",
         "is_short",
     ]
     post_feats = ["like_ratio", "comment_ratio", "engagement"]
     feats = base_feats + (post_feats if use_post_publish_features else [])
+
+    if split_mode == "channel_holdout":
+        channels = df["channel_id"].dropna().unique().tolist()
+        if len(channels) < 2:
+            raise ValueError("Need at least 2 channels in feature_df for channel_holdout split.")
+        train_ch, test_ch = train_test_split(
+            channels,
+            test_size=channel_test_frac,
+            random_state=random_state,
+        )
+        train = df[df["channel_id"].isin(train_ch)].copy()
+        test = df[df["channel_id"].isin(test_ch)].copy()
+    else:
+        # chronological split inside each channel
+        df["row_in_channel"] = df.groupby("channel_id").cumcount()
+        df["n_in_channel"] = df.groupby("channel_id")["views"].transform("count")
+        denom = (df["n_in_channel"] - 1).replace(0, np.nan)
+        df["pct_in_channel"] = df["row_in_channel"] / denom
+        is_test = df["pct_in_channel"] >= (1.0 - test_frac_per_channel)
+
+        train = df[~is_test].copy()
+        test = df[is_test].copy()
+
+    if train.empty or test.empty:
+        raise ValueError(
+            f"Split produced empty train/test. train_rows={len(train)} test_rows={len(test)} "
+            f"(split_mode={split_mode})."
+        )
 
     train_X = train[feats].fillna(0.0).to_numpy(dtype=float)
     test_X = test[feats].fillna(0.0).to_numpy(dtype=float)
@@ -158,28 +183,42 @@ def train_view_model(
     v_true = test["views"].to_numpy(dtype=float)
     v_pred = np.clip(test["baseline_views"].to_numpy(dtype=float) * pr_pred, 0, None)
 
-    metrics = {
+    metrics: Dict[str, float] = {
+        "split_mode": split_mode,
         "test_rows": float(len(test)),
+        "train_channels": float(train["channel_id"].nunique()),
+        "test_channels": float(test["channel_id"].nunique()),
         "MAE_views": float(mean_absolute_error(v_true, v_pred)),
         "MAPE_views": float(mean_absolute_percentage_error(np.maximum(v_true, 1.0), np.maximum(v_pred, 1.0))),
         "MAE_ratio": float(mean_absolute_error(pr_true, pr_pred)),
         "MAPE_ratio": float(mean_absolute_percentage_error(np.maximum(pr_true, 1e-6), np.maximum(pr_pred, 1e-6))),
     }
 
-    perm_df = None
+    # Permutation importance (on test set, subsampled)
+    perm_df: Optional[pd.DataFrame] = None
     try:
-        sample_n = min(2000, len(test))
+        n_test = len(test)
+        sample_n = int(min(perm_max_rows, n_test))
+        # importance is noisy on tiny samples; require a reasonable number
         if sample_n >= 200:
-            idx = np.linspace(0, len(test) - 1, sample_n).astype(int)
-            r = permutation_importance(model, test_X[idx], y_test[idx], n_repeats=8, random_state=random_state)
+            # deterministic evenly-spaced sample (keeps it stable across runs)
+            idx = np.linspace(0, n_test - 1, sample_n).astype(int)
+            r = permutation_importance(
+                model,
+                test_X[idx],
+                y_test[idx],
+                n_repeats=perm_repeats,
+                random_state=random_state,
+            )
             perm_df = (
                 pd.DataFrame({"feature": feats, "importance_mean": r.importances_mean})
                 .sort_values("importance_mean", ascending=False)
+                .reset_index(drop=True)
             )
     except Exception:
         perm_df = None
 
-    # Store feature names on the model for convenience
+    # Helpful for downstream: keep feature order attached to the model
     model.feature_names_in_ = np.array(feats, dtype=object)
 
     return TrainResult(model=model, feature_names=feats, metrics=metrics, perm_importance=perm_df)
