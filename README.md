@@ -122,11 +122,11 @@ Train and compare models:
 
 This:
 
--   Loads all videos from SQLite\
--   Builds leakage-safe feature frames\
--   Evaluates multiple model families\
--   Benchmarks per split strategy\
--   Writes leaderboards to `runs/`\
+-   Loads all videos from SQLite
+-   Builds leakage-safe feature frames
+-   Evaluates multiple model families
+-   Benchmarks per split strategy
+-   Writes leaderboards to `runs/`
 -   Saves two best model bundles:
 
 
