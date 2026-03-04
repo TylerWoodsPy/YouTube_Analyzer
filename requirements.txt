@@ -7,3 +7,6 @@ isodate
 scikit-learn
 joblib
 numpy
+google-api-python-client
+requests
+networkx

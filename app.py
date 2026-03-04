@@ -4,13 +4,23 @@ import plotly.express as px
 import plotly.graph_objects as go
 import pandas as pd
 import joblib
+import re
 import numpy as np
+from collections import Counter
+
+# Optional dependency for topic graph visualization
+try:
+    import networkx as nx
+except Exception:
+    nx = None
 
 from yt_api import (
     get_channel_id,
     get_upload_playlist,
     get_video_ids,
     get_video_stats,
+    search_video_ids,
+    related_video_ids,
 )
 
 from transform import videos_to_rows
@@ -236,25 +246,100 @@ if "df" in st.session_state:
     k3.metric("Videos", stats.get("videoCount"))
 
     # Date range filter (reactive)
-    max_date = df["published"].max()
-    min_date = df["published"].min()
-    default_start = max(max_date - pd.Timedelta(days=180), min_date)
+    # Anchor presets to the latest available data date (max_date), not "today",
+    # so preset ranges never exceed what exists in the DB.
+    max_date_dt = df["published"].max()
+    min_date_dt = df["published"].min()
 
-    start_date, end_date = st.date_input(
-        "Show data between",
-        value=(default_start.date(), max_date.date()),
-        min_value=min_date.date(),
-        max_value=max_date.date(),
-        key="date_range",
+    max_d = max_date_dt.date()
+    min_d = min_date_dt.date()
+
+    import datetime as _dt
+
+    def _clamp_range(s: _dt.date, e: _dt.date) -> tuple[_dt.date, _dt.date]:
+        s = max(s, min_d)
+        e = min(e, max_d)
+        if s > e:
+            s = e
+        return s, e
+
+    # Preset selector (single control)
+    preset_options = [
+        "Last 7 Days",
+        "Last 28 Days",
+        "Last 90 Days",
+        "Last 180 Days",
+        "Last 365 Days",
+        "All Time",
+        "Custom",
+    ]
+
+    if "time_range_preset" not in st.session_state:
+        st.session_state["time_range_preset"] = "Last 180 Days"
+
+    preset = st.selectbox(
+        "Time range",
+        preset_options,
+        index=preset_options.index(st.session_state["time_range_preset"]),
+        key="time_range_preset",
     )
+
+    # Initialize date range once
+    if "date_range" not in st.session_state or not isinstance(st.session_state["date_range"], (tuple, list)) or len(st.session_state["date_range"]) != 2:
+        st.session_state["date_range"] = _clamp_range(max_d - _dt.timedelta(days=180), max_d)
+
+    # Compute the expected range for a preset (anchored to max_d)
+    def _range_for_preset(p: str) -> tuple[_dt.date, _dt.date]:
+        if p == "All Time":
+            return (min_d, max_d)
+        if p.startswith("Last "):
+            # "Last 180 Days" -> 180
+            try:
+                days = int(p.split()[1])
+            except Exception:
+                days = 180
+            return _clamp_range(max_d - _dt.timedelta(days=days), max_d)
+        # Custom -> keep current
+        s, e = st.session_state["date_range"]
+        return _clamp_range(s, e)
+
+    # Apply preset selection to session state BEFORE rendering date_input
+    if preset != "Custom":
+        st.session_state["date_range"] = _range_for_preset(preset)
+    else:
+        s, e = st.session_state["date_range"]
+        st.session_state["date_range"] = _clamp_range(s, e)
+    # Date range UI:
+    # - If preset != Custom: we do NOT show a second "competing" date picker. We just display the computed range.
+    # - If preset == Custom: we show the date picker to let the user choose an arbitrary range.
+    if preset == "Custom":
+        # Date input (do not set value= when also using key/session_state)
+        start_date, end_date = st.date_input(
+            "Show data between",
+            min_value=min_d,
+            max_value=max_d,
+            key="date_range",
+        )
+        # Clamp and persist
+        current_range = _clamp_range(start_date, end_date)
+        start_date, end_date = current_range
+    else:
+        # Preset mode: range already set in session_state
+        start_date, end_date = st.session_state["date_range"]
+        current_range = (start_date, end_date)
+        st.caption(f"Show data between: {start_date:%Y/%m/%d} – {end_date:%Y/%m/%d}")
+
+    # Final clamp (safety) and filter
+
+    start_date, end_date = current_range
 
     df_filt = df[
         (df["published"].dt.date >= start_date) &
         (df["published"].dt.date <= end_date)
     ].copy()
 
-    tab_overview, tab_performance, tab_relationships, tab_outliers, tab_growth, tab_predict, tab_table = st.tabs(
-        ["Overview", "Performance", "Relationships", "Winners & Outliers", "Growth & Velocity", "Predict Views", "Table"]
+    tab_overview, tab_performance, tab_relationships, tab_outliers, tab_growth, tab_keyword, tab_predict, tab_table = st.tabs(
+        ["Overview", "Performance", "Relationships", "Winners & Outliers", "Growth & Velocity", "Keyword Intel", "Predict Views", "Table"]
     )
 
     # -----------------------------
@@ -844,5 +929,342 @@ if "df" in st.session_state:
                 warnings.append("Very limited snapshot coverage — rankings may be noisy.")
             if warnings:
                 st.warning(" / ".join(warnings))
+    # -----------------------------
+    # Keyword Intel tab (public, in-memory)
+    # -----------------------------
+    with tab_keyword:
+        st.subheader("Keyword Intel (Public)")
+
+        st.caption("Uses YouTube Data API v3 search + video metadata. No channel ownership required. "
+                   "Traffic sources / impressions / CTR are not available for channels you don't manage.")
+
+        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+        seed = c1.text_input("Seed keyword / query", value="", placeholder="e.g., osrs zulrah money making")
+        order = c2.selectbox("Order", ["relevance", "viewCount", "date", "rating"], index=0)
+        max_results = c3.slider("Analyze top N videos", 10, 200, 50, step=10)
+        ngram_max = c4.selectbox("Phrases", ["bigrams", "bigrams+trigrams"], index=1)
+
+        c5, c6, c7 = st.columns([1, 1, 2])
+        region = c5.text_input("Region code (optional)", value="", placeholder="US")
+        lang = c6.text_input("Language (optional)", value="", placeholder="en")
+        published_after_days = c7.number_input("Only include videos published in last N days (optional)", min_value=0, max_value=3650, value=0, step=7)
+
+        expand_related = st.checkbox("Expand with related videos (topic neighborhood)", value=False)
+        if expand_related:
+            c8, c9 = st.columns(2)
+            anchors = c8.slider("Anchor videos", 1, 10, 2)
+            related_per = c9.slider("Related per anchor", 5, 50, 10, step=5)
+            est_search_calls = 1 + int(anchors)
+            est_video_calls = (max_results // 50) + 1
+            est_units = est_search_calls * 100 + est_video_calls * 1
+
+            st.caption(
+                f"Estimated cost: ~{est_units} quota units "
+                f"({est_search_calls} search calls, {est_video_calls} metadata calls)."
+            )
+
+        # Optional visualization: recommendation neighborhood graph
+        show_graph = st.checkbox("Show topic ecosystem graph (video → related videos)", value=False)
+        if show_graph:
+            g1, g2, g3 = st.columns(3)
+            graph_max_nodes = g1.slider("Max nodes", 50, 600, 250, step=50)
+            graph_min_views = g2.number_input("Hide nodes with < views", min_value=0, value=0, step=1000)
+            color_by = g3.selectbox("Color nodes by", ["channel", "top_phrase", "none"], index=0)
+        else:
+            graph_max_nodes = 250
+            graph_min_views = 0
+            color_by = "channel"
+
+        run = st.button("Run keyword analysis", type="primary", disabled=not bool(seed.strip()))
+
+        if run:
+            now_utc = datetime.now(timezone.utc)
+
+            published_after = None
+            if published_after_days and int(published_after_days) > 0:
+                dt = now_utc - timedelta(days=int(published_after_days))
+                published_after = dt.isoformat().replace("+00:00", "Z")
+
+            with st.spinner("Searching videos..."):
+                base_ids, total_results = search_video_ids(
+                    q=seed.strip(),
+                    max_results=int(max_results),
+                    order=order,
+                    region_code=region.strip() or None,
+                    relevance_language=lang.strip() or None,
+                    published_after=published_after,
+                )
+
+            ids = list(base_ids)
+            edges = []  # (source_video_id, related_video_id)
+
+            if expand_related and ids:
+                with st.spinner("Expanding with related videos..."):
+                    for vid in ids[:int(anchors)]:
+                        rel = related_video_ids(
+                            video_id=vid,
+                            max_results=int(related_per),
+                            order="relevance",
+                            region_code=region.strip() or None,
+                            relevance_language=lang.strip() or None,
+                        )
+                        for r in rel:
+                            edges.append((vid, r))
+                        ids.extend(rel)
+                # de-dupe while preserving order
+                seen = set()
+                ids = [x for x in ids if not (x in seen or seen.add(x))]
+                ids = ids[:int(max_results)]
+
+            with st.spinner("Fetching video metadata..."):
+                items = get_video_stats(ids)
+
+            if not items:
+                st.warning("No videos returned for this query (try different wording, remove filters, or change order).")
+            else:
+                rows = []
+                all_tags = []
+                phrase_counter = Counter()
+
+                # phrase extractor
+                def _words(s):
+                    return re.findall(r"[a-z0-9']+", (s or "").lower())
+
+                def _ngrams(words, n):
+                    return [" ".join(words[i:i+n]) for i in range(0, len(words)-n+1)]
+
+                for v in items:
+                    sn = v.get("snippet", {})
+                    stt = v.get("statistics", {})
+                    title = sn.get("title", "")
+                    published_at = sn.get("publishedAt")
+
+                    try:
+                        published_dt = pd.to_datetime(published_at, utc=True) if published_at else pd.NaT
+                    except Exception:
+                        published_dt = pd.NaT
+
+                    views = int(stt.get("viewCount", 0) or 0)
+                    likes = int(stt.get("likeCount", 0) or 0) if "likeCount" in stt else None
+                    comments = int(stt.get("commentCount", 0) or 0) if "commentCount" in stt else None
+
+                    age_days = None
+                    vpd = None
+                    if pd.notna(published_dt):
+                        age_seconds = (now_utc - published_dt.to_pydatetime()).total_seconds()
+                        age_days = max(age_seconds / 86400.0, 1.0)
+                        vpd = views / age_days
+
+                    tags = sn.get("tags", []) or []
+                    all_tags.extend([t.lower() for t in tags])
+
+                    w = _words(title)
+                    for bg in _ngrams(w, 2):
+                        phrase_counter[bg] += 1
+                    if ngram_max == "bigrams+trigrams":
+                        for tg in _ngrams(w, 3):
+                            phrase_counter[tg] += 1
+
+                    rows.append({
+                        "video_id": v.get("id"),
+                        "channel_id": sn.get("channelId"),
+                        "title": title,
+                        "uploader": sn.get("channelTitle", ""),
+                        "published_at": published_dt,
+                        "views": views,
+                        "likes": likes,
+                        "comments": comments,
+                        "views_per_day": vpd,
+                        "age_days": age_days,
+                        "url": f"https://www.youtube.com/watch?v={v.get('id')}",
+                    })
+
+                dfk = pd.DataFrame(rows)
+                dfk["views_per_day"] = pd.to_numeric(dfk["views_per_day"], errors="coerce")
+                dfk["age_days"] = pd.to_numeric(dfk["age_days"], errors="coerce")
+
+                # --- Opportunity score ---
+                med_vpd = float(dfk["views_per_day"].median(skipna=True)) if dfk["views_per_day"].notna().any() else float("nan")
+                denom = np.log10(total_results) if total_results and total_results > 1 else np.nan
+                opp = med_vpd / denom if pd.notna(med_vpd) and pd.notna(denom) and denom > 0 else np.nan
+
+                # heuristic label
+                label = "—"
+                if pd.notna(opp):
+                    if opp < 100:
+                        label = "Low"
+                    elif opp < 300:
+                        label = "Medium"
+                    elif opp < 800:
+                        label = "High"
+                    else:
+                        label = "Very high"
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Competition (totalResults)", f"{int(total_results):,}" if total_results is not None else "—")
+                m2.metric("Median views/day (top set)", f"{med_vpd:,.0f}" if pd.notna(med_vpd) else "—")
+                m3.metric("Opportunity score", f"{opp:,.1f}" if pd.notna(opp) else "—")
+                m4.metric("Opportunity label", label)
+
+                st.caption("Opportunity score = median_views_per_day / log10(totalResults). "
+                           "This is a *proxy* score (not official search volume).")
+
+                # --- Top videos table ---
+                st.markdown("### Top videos")
+                sort_metric = st.selectbox("Sort top videos by", ["views_per_day", "views", "age_days"], index=0)
+                topn = st.slider("Show top N videos", 5, min(100, len(dfk)), min(25, len(dfk)))
+                top_vids = dfk.sort_values(sort_metric, ascending=False).head(int(topn)).copy()                # Show uploader + clickable video link
+                show_cols = ["title", "uploader", "views", "age_days", "views_per_day", "likes", "comments", "url"]
+                st.dataframe(
+                    top_vids[show_cols],
+                    use_container_width=True,
+                    column_config={
+                        "uploader": st.column_config.TextColumn("Uploader"),
+                        "url": st.column_config.LinkColumn("Video", display_text="Open"),
+                    },
+                )
+
+                # --- Tags ---
+                st.markdown("### Tag frequency (when available)")
+                if all_tags:
+                    tag_counts = pd.Series(all_tags).value_counts().head(50).reset_index()
+                    tag_counts.columns = ["tag", "count"]
+                    st.dataframe(tag_counts, use_container_width=True)
+                else:
+                    st.info("No tags returned for this video set (common). Titles/phrases are usually more reliable.")
+
+                # --- Common phrases ---
+                st.markdown("### Common title phrases")
+                if phrase_counter:
+                    phrase_df = pd.DataFrame(phrase_counter.most_common(50), columns=["phrase", "count"])
+                    st.dataframe(phrase_df, use_container_width=True)
+
+                # --- Topic ecosystem graph (optional) ---
+                if show_graph:
+                    if nx is None:
+                        st.info("Install `networkx` to enable the graph: pip install networkx")
+                    else:
+                        st.markdown("### Topic ecosystem graph")
+                        st.caption("Nodes are videos; edges indicate YouTube 'related videos' connections. Node size scales with views (log).")
+
+                        # Lookup maps
+                        id_to_title = dict(zip(dfk["video_id"].astype(str), dfk["title"]))
+                        id_to_channel = dict(zip(dfk["video_id"].astype(str), dfk["uploader"]))
+                        id_to_views = dict(zip(dfk["video_id"].astype(str), dfk["views"].fillna(0)))
+
+                        # Optional: simple phrase label per node (first "strong" bigram)
+                        def _top_phrase_for_title(title: str) -> str:
+                            w = _words(title)
+                            bgs = _ngrams(w, 2)
+                            for bg in bgs:
+                                if phrase_counter.get(bg, 0) >= 2:
+                                    return bg
+                            return "—"
+
+                        id_to_phrase = {}
+                        if color_by == "top_phrase":
+                            for vid_, title_ in id_to_title.items():
+                                id_to_phrase[vid_] = _top_phrase_for_title(title_)
+
+                                                # Build directed graph (anchor -> related)
+                        G = nx.DiGraph()
+
+                        # Add nodes from BOTH:
+                        #  - fetched metadata (dfk)
+                        #  - recommendation edges (so related nodes can appear even if we didn't fetch their metadata)
+                        nodes = set()
+                        for vid_ in dfk["video_id"].dropna().astype(str).tolist():
+                            nodes.add(vid_)
+                        for a_, b_ in edges:
+                            nodes.add(str(a_))
+                            nodes.add(str(b_))
+
+                        # Optional min-views filter (unknown/unfetched nodes count as 0 views)
+                        if graph_min_views and int(graph_min_views) > 0:
+                            nodes = {n for n in nodes if int(id_to_views.get(n, 0) or 0) >= int(graph_min_views)}
+
+                        G.add_nodes_from(nodes)
+
+                        # Add edges (anchor -> related) whenever both endpoints are in our node set
+                        for a_, b_ in edges:
+                            a_ = str(a_)
+                            b_ = str(b_)
+                            if a_ in G and b_ in G:
+                                G.add_edge(a_, b_)
+
+# Cap nodes to keep it readable (keep most connected)
+                        if G.number_of_nodes() > int(graph_max_nodes):
+                            deg = sorted(G.degree, key=lambda x: x[1], reverse=True)
+                            keep = set([n for n, _ in deg[:int(graph_max_nodes)]])
+                            G = G.subgraph(keep).copy()
+
+                        if G.number_of_nodes() < 5 or G.number_of_edges() < 3:
+                            st.info("Graph too small with current filters. Try enabling related expansion, increasing Max nodes, or lowering the min views filter.")
+                        else:
+                            # Layout
+                            pos = nx.spring_layout(G, k=0.45, iterations=75, seed=42)
+
+                            def _group(n: str) -> str:
+                                if color_by == "channel":
+                                    return str(id_to_channel.get(n, "—"))
+                                if color_by == "top_phrase":
+                                    return str(id_to_phrase.get(n, "—"))
+                                return "—"
+
+                            groups = [_group(n) for n in G.nodes()]
+                            uniq = {g: i for i, g in enumerate(sorted(set(groups)))}
+                            node_color = [uniq[g] for g in groups]
+
+                            # Edges trace
+                            edge_x, edge_y = [], []
+                            for s_, t_ in G.edges():
+                                x0, y0 = pos[s_]
+                                x1, y1 = pos[t_]
+                                edge_x += [x0, x1, None]
+                                edge_y += [y0, y1, None]
+
+                            edge_trace = go.Scatter(
+                                x=edge_x,
+                                y=edge_y,
+                                mode="lines",
+                                line=dict(width=1),
+                                hoverinfo="none",
+                            )
+
+                            # Nodes trace
+                            node_x, node_y, node_text, node_size = [], [], [], []
+                            for n in G.nodes():
+                                x, y = pos[n]
+                                node_x.append(x)
+                                node_y.append(y)
+                                title_ = id_to_title.get(n, n)
+                                ch_ = id_to_channel.get(n, "—")
+                                views_ = int(id_to_views.get(n, 0) or 0)
+                                node_text.append(f"{title_}<br>{ch_}<br>Views: {views_:,}")
+                                node_size.append(max(8, min(35, float(np.log1p(views_)) * 2)))
+
+                            node_trace = go.Scatter(
+                                x=node_x,
+                                y=node_y,
+                                mode="markers",
+                                hoverinfo="text",
+                                text=node_text,
+                                marker=dict(
+                                    size=node_size,
+                                    color=node_color,
+                                    showscale=True,
+                                    colorbar=dict(title=color_by),
+                                ),
+                            )
+
+                            fig = go.Figure(data=[edge_trace, node_trace])
+                            fig.update_layout(
+                                showlegend=False,
+                                margin=dict(l=10, r=10, t=10, b=10),
+                                xaxis=dict(showgrid=False, zeroline=False, visible=False),
+                                yaxis=dict(showgrid=False, zeroline=False, visible=False),
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+
 else:
     st.info("Enter a channel and click Analyze to load data.")
