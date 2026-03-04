@@ -176,46 +176,99 @@ def related_video_ids(
     region_code: str = None,
     relevance_language: str = None,
 ):
-    """Return up to max_results videos related to a given video_id.
+    """Return up to max_results videos that are *similar* to a given video_id.
 
-    IMPORTANT: We intentionally bypass googleapiclient here because some environments
-    have a broken discovery schema that rejects `relatedToVideoId` at call-time.
+    NOTE (important): The official YouTube Data API v3 `search.list` parameter
+    `relatedToVideoId` was deprecated and is no longer supported (returns 400 INVALID_ARGUMENT).
+    So we implement a practical fallback:
 
-    `order` is accepted for call-site compatibility but is ignored by this request type.
+      1) Fetch the seed video's title via `videos.list`
+      2) Run a normal `search.list` query using a trimmed version of that title
+      3) Return the resulting video IDs (excluding the seed id)
+
+    This gives you "topic-adjacent" videos good enough to build an ecosystem graph.
+
+    Returns:
+        (ids, err) where err is None on success, or a dict describing the failure.
     """
     if not API_KEY:
-        # Soft-fail: keyword expansion should not break the whole app
-        return []
+        return [], {"status": None, "reason": "missing_api_key"}
 
     vid = (video_id or "").strip()
     if not _YT_VIDEO_ID_RE.match(vid):
-        return []
+        return [], {"status": None, "reason": "invalid_video_id"}
 
-    params = {
-        "key": API_KEY,
-        "part": "snippet",
-        "type": "video",
-        "relatedToVideoId": vid,
-        "maxResults": min(int(max_results), 50),
-    }
-    if region_code:
-        params["regionCode"] = region_code
-    if relevance_language:
-        params["relevanceLanguage"] = relevance_language
-
-    url = "https://www.googleapis.com/youtube/v3/search"
+    # 1) Fetch title
     try:
-        r = requests.get(url, params=params, timeout=20)
-        if r.status_code != 200:
-            return []
-        data = r.json()
-    except Exception:
-        return []
+        resp = youtube.videos().list(part="snippet", id=vid).execute()
+        items = resp.get("items", [])
+        if not items:
+            return [], {"status": 404, "reason": "video_not_found"}
+        title = (items[0].get("snippet", {}) or {}).get("title", "") or ""
+    except Exception as e:
+        return [], {"status": "exception", "reason": "videos_list_failed", "body": str(e)}
 
-    ids = []
-    for item in data.get("items", []):
-        v = item.get("id", {}).get("videoId")
-        if v:
-            ids.append(v)
+    # 2) Build a reasonable query from the title
+    # Keep it simple and robust: strip non-word, cap length, remove very short tokens.
+    tokens = re.findall(r"[A-Za-z0-9']+", title.lower())
+    tokens = [t for t in tokens if len(t) >= 3]
+    query = " ".join(tokens[:10]).strip()
+    if not query:
+        # fall back to raw title truncated
+        query = title.strip()[:80]
+    if not query:
+        return [], {"status": None, "reason": "empty_title_query"}
 
-    return ids[:max_results]
+    # 3) Search by the derived query
+    try:
+        ids, _total = search_video_ids(
+            q=query,
+            max_results=int(max_results) + 5,  # grab a few extra so we can drop self
+            order="relevance",
+            region_code=region_code,
+            relevance_language=relevance_language,
+        )
+    except Exception as e:
+        return [], {"status": "exception", "reason": "search_failed", "body": str(e)}
+
+    ids = [x for x in ids if x and x != vid]
+    return ids[:max_results], None
+
+def fetch_videos_metadata(video_ids: list[str]) -> tuple[dict, dict | None]:
+    """Fetch snippet+statistics for many video IDs (batched by 50)."""
+    if not API_KEY:
+        return {}, {"status": None, "reason": "missing_api_key"}
+    ids = [v.strip() for v in (video_ids or []) if v and _YT_VIDEO_ID_RE.match(v.strip())]
+    if not ids:
+        return {}, None
+
+    meta: dict[str, dict] = {}
+    try:
+        for i in range(0, len(ids), 50):
+            chunk = ids[i:i+50]
+            resp = youtube.videos().list(
+                part="snippet,statistics",
+                id=",".join(chunk),
+                maxResults=len(chunk),
+            ).execute()
+            for it in resp.get("items", []):
+                vid = it.get("id")
+                sn = it.get("snippet", {}) or {}
+                st = it.get("statistics", {}) or {}
+                if not vid:
+                    continue
+                def _to_int(x):
+                    try:
+                        return int(x)
+                    except Exception:
+                        return None
+                meta[vid] = {
+                    "title": sn.get("title") or "",
+                    "channelId": sn.get("channelId") or "",
+                    "channelTitle": sn.get("channelTitle") or "",
+                    "publishedAt": sn.get("publishedAt") or "",
+                    "viewCount": _to_int(st.get("viewCount")) or 0,
+                }
+        return meta, None
+    except Exception as e:
+        return meta, {"status": "exception", "reason": "videos_metadata_failed", "body": str(e)}

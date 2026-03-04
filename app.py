@@ -14,7 +14,7 @@ try:
 except Exception:
     nx = None
 
-from yt_api import (
+from yt_api import (fetch_videos_metadata,
     get_channel_id,
     get_upload_playlist,
     get_video_ids,
@@ -949,6 +949,10 @@ if "df" in st.session_state:
         lang = c6.text_input("Language (optional)", value="", placeholder="en")
         published_after_days = c7.number_input("Only include videos published in last N days (optional)", min_value=0, max_value=3650, value=0, step=7)
 
+        # Defaults (used if graph auto-enables related expansion)
+        anchors = 2
+        related_per = 10
+
         expand_related = st.checkbox("Expand with related videos (topic neighborhood)", value=False)
         if expand_related:
             c8, c9 = st.columns(2)
@@ -965,6 +969,12 @@ if "df" in st.session_state:
 
         # Optional visualization: recommendation neighborhood graph
         show_graph = st.checkbox("Show topic ecosystem graph (video → related videos)", value=False)
+        # The topic graph needs recommendation edges. If the user enables the graph but
+        # leaves expansion off, auto-enable it with sensible defaults.
+        if show_graph and not expand_related:
+            st.info("Topic graph needs related expansion; enabling it with defaults (2 anchors, 10 related each). Turn on \"Expand with related videos\" to customize.")
+            expand_related = True
+
         if show_graph:
             g1, g2, g3 = st.columns(3)
             graph_max_nodes = g1.slider("Max nodes", 50, 600, 250, step=50)
@@ -997,17 +1007,25 @@ if "df" in st.session_state:
 
             ids = list(base_ids)
             edges = []  # (source_video_id, related_video_id)
+            related_map = {}  # anchor_video_id -> [expanded_video_ids]
 
             if expand_related and ids:
                 with st.spinner("Expanding with related videos..."):
                     for vid in ids[:int(anchors)]:
-                        rel = related_video_ids(
+                        rel, err = related_video_ids(
                             video_id=vid,
                             max_results=int(related_per),
                             order="relevance",
                             region_code=region.strip() or None,
                             relevance_language=lang.strip() or None,
                         )
+                        related_map[str(vid)] = list(rel or [])
+                        if err:
+                            st.warning(
+                                f"Expansion lookup failed for {vid}: "
+                                f"{err.get('status')} | {err.get('reason','')} "
+                                f"{(str(err.get('body',''))[:300])}"
+                            )
                         for r in rel:
                             edges.append((vid, r))
                         ids.extend(rel)
@@ -1145,12 +1163,29 @@ if "df" in st.session_state:
                         st.info("Install `networkx` to enable the graph: pip install networkx")
                     else:
                         st.markdown("### Topic ecosystem graph")
-                        st.caption("Nodes are videos; edges indicate YouTube 'related videos' connections. Node size scales with views (log).")
+                        st.caption("Nodes are videos; edges come from topic expansion (title-based, since YouTube deprecated `relatedToVideoId`). Node size scales with views (log).")
 
-                        # Lookup maps
+                        # Lookup maps (seeded from dfk, then enriched for expanded-only nodes)
                         id_to_title = dict(zip(dfk["video_id"].astype(str), dfk["title"]))
                         id_to_channel = dict(zip(dfk["video_id"].astype(str), dfk["uploader"]))
                         id_to_views = dict(zip(dfk["video_id"].astype(str), dfk["views"].fillna(0)))
+
+                        # Add nodes referenced by expansion edges (even if they weren't in dfk)
+                        nodes = set(dfk["video_id"].dropna().astype(str).tolist())
+                        for a_, b_ in edges:
+                            nodes.add(str(a_))
+                            nodes.add(str(b_))
+
+                        # Enrich missing nodes so sizes aren't zero
+                        missing = [n for n in nodes if n not in id_to_views]
+                        if missing:
+                            meta_map, meta_err = fetch_videos_metadata(missing)
+                            if meta_err:
+                                st.warning(f"Metadata lookup issue: {meta_err}")
+                            for vid_, md in (meta_map or {}).items():
+                                id_to_title.setdefault(vid_, md.get("title", vid_))
+                                id_to_channel.setdefault(vid_, md.get("channelTitle", ""))
+                                id_to_views.setdefault(vid_, int(md.get("viewCount", 0) or 0))
 
                         # Optional: simple phrase label per node (first "strong" bigram)
                         def _top_phrase_for_title(title: str) -> str:
@@ -1166,18 +1201,10 @@ if "df" in st.session_state:
                             for vid_, title_ in id_to_title.items():
                                 id_to_phrase[vid_] = _top_phrase_for_title(title_)
 
-                                                # Build directed graph (anchor -> related)
-                        G = nx.DiGraph()
-
-                        # Add nodes from BOTH:
-                        #  - fetched metadata (dfk)
-                        #  - recommendation edges (so related nodes can appear even if we didn't fetch their metadata)
-                        nodes = set()
-                        for vid_ in dfk["video_id"].dropna().astype(str).tolist():
-                            nodes.add(vid_)
-                        for a_, b_ in edges:
-                            nodes.add(str(a_))
-                            nodes.add(str(b_))
+                        # Build graph (undirected) and add:
+                        #  - anchor -> expanded edges
+                        #  - projection edges between expanded vids that share an anchor (adds internal structure)
+                        G = nx.Graph()
 
                         # Optional min-views filter (unknown/unfetched nodes count as 0 views)
                         if graph_min_views and int(graph_min_views) > 0:
@@ -1185,86 +1212,98 @@ if "df" in st.session_state:
 
                         G.add_nodes_from(nodes)
 
-                        # Add edges (anchor -> related) whenever both endpoints are in our node set
+                        # Add edges (anchor -> expanded)
                         for a_, b_ in edges:
                             a_ = str(a_)
                             b_ = str(b_)
                             if a_ in G and b_ in G:
-                                G.add_edge(a_, b_)
+                                G.add_edge(a_, b_, weight=1)
 
-# Cap nodes to keep it readable (keep most connected)
+                        # Projection edges (shared anchors)
+                        from itertools import combinations
+                        for a_, rels in (related_map or {}).items():
+                            rels = [str(r) for r in (rels or []) if str(r) in G]
+                            rels = [r for r in rels if r != str(a_)]
+                            for u, v in combinations(rels, 2):
+                                if u == v:
+                                    continue
+                                if G.has_edge(u, v):
+                                    G[u][v]["weight"] = G[u][v].get("weight", 1) + 1
+                                else:
+                                    G.add_edge(u, v, weight=1)
+
+                        # Cap nodes to keep it readable (keep most connected)
                         if G.number_of_nodes() > int(graph_max_nodes):
                             deg = sorted(G.degree, key=lambda x: x[1], reverse=True)
                             keep = set([n for n, _ in deg[:int(graph_max_nodes)]])
                             G = G.subgraph(keep).copy()
 
-                        if G.number_of_nodes() < 5 or G.number_of_edges() < 3:
-                            st.info("Graph too small with current filters. Try enabling related expansion, increasing Max nodes, or lowering the min views filter.")
-                        else:
-                            # Layout
-                            pos = nx.spring_layout(G, k=0.45, iterations=75, seed=42)
+                        if G.number_of_nodes() < 5:
+                            st.info("Graph too small with current filters. Try increasing Max nodes or lowering the min views filter.")
+# Layout
+    pos = nx.spring_layout(G, k=0.45, iterations=75, seed=42)
 
-                            def _group(n: str) -> str:
-                                if color_by == "channel":
-                                    return str(id_to_channel.get(n, "—"))
-                                if color_by == "top_phrase":
-                                    return str(id_to_phrase.get(n, "—"))
-                                return "—"
+    def _group(n: str) -> str:
+        if color_by == "channel":
+            return str(id_to_channel.get(n, "—"))
+        if color_by == "top_phrase":
+            return str(id_to_phrase.get(n, "—"))
+        return "—"
 
-                            groups = [_group(n) for n in G.nodes()]
-                            uniq = {g: i for i, g in enumerate(sorted(set(groups)))}
-                            node_color = [uniq[g] for g in groups]
+    groups = [_group(n) for n in G.nodes()]
+    uniq = {g: i for i, g in enumerate(sorted(set(groups)))}
+    node_color = [uniq[g] for g in groups]
 
-                            # Edges trace
-                            edge_x, edge_y = [], []
-                            for s_, t_ in G.edges():
-                                x0, y0 = pos[s_]
-                                x1, y1 = pos[t_]
-                                edge_x += [x0, x1, None]
-                                edge_y += [y0, y1, None]
+    # Edges trace
+    edge_x, edge_y = [], []
+    for s_, t_ in G.edges():
+        x0, y0 = pos[s_]
+        x1, y1 = pos[t_]
+        edge_x += [x0, x1, None]
+        edge_y += [y0, y1, None]
 
-                            edge_trace = go.Scatter(
-                                x=edge_x,
-                                y=edge_y,
-                                mode="lines",
-                                line=dict(width=1),
-                                hoverinfo="none",
-                            )
+    edge_trace = go.Scatter(
+        x=edge_x,
+        y=edge_y,
+        mode="lines",
+        line=dict(width=1),
+        hoverinfo="none",
+    )
 
-                            # Nodes trace
-                            node_x, node_y, node_text, node_size = [], [], [], []
-                            for n in G.nodes():
-                                x, y = pos[n]
-                                node_x.append(x)
-                                node_y.append(y)
-                                title_ = id_to_title.get(n, n)
-                                ch_ = id_to_channel.get(n, "—")
-                                views_ = int(id_to_views.get(n, 0) or 0)
-                                node_text.append(f"{title_}<br>{ch_}<br>Views: {views_:,}")
-                                node_size.append(max(8, min(35, float(np.log1p(views_)) * 2)))
+    # Nodes trace
+    node_x, node_y, node_text, node_size = [], [], [], []
+    for n in G.nodes():
+        x, y = pos[n]
+        node_x.append(x)
+        node_y.append(y)
+        title_ = id_to_title.get(n, n)
+        ch_ = id_to_channel.get(n, "—")
+        views_ = int(id_to_views.get(n, 0) or 0)
+        node_text.append(f"{title_}<br>{ch_}<br>Views: {views_:,}")
+        node_size.append(max(8, min(35, float(np.log1p(views_)) * 2)))
 
-                            node_trace = go.Scatter(
-                                x=node_x,
-                                y=node_y,
-                                mode="markers",
-                                hoverinfo="text",
-                                text=node_text,
-                                marker=dict(
-                                    size=node_size,
-                                    color=node_color,
-                                    showscale=True,
-                                    colorbar=dict(title=color_by),
-                                ),
-                            )
+    node_trace = go.Scatter(
+        x=node_x,
+        y=node_y,
+        mode="markers",
+        hoverinfo="text",
+        text=node_text,
+        marker=dict(
+            size=node_size,
+            color=node_color,
+            showscale=True,
+            colorbar=dict(title=color_by),
+        ),
+    )
 
-                            fig = go.Figure(data=[edge_trace, node_trace])
-                            fig.update_layout(
-                                showlegend=False,
-                                margin=dict(l=10, r=10, t=10, b=10),
-                                xaxis=dict(showgrid=False, zeroline=False, visible=False),
-                                yaxis=dict(showgrid=False, zeroline=False, visible=False),
-                            )
-                            st.plotly_chart(fig, use_container_width=True)
+    fig = go.Figure(data=[edge_trace, node_trace])
+    fig.update_layout(
+        showlegend=False,
+        margin=dict(l=10, r=10, t=10, b=10),
+        xaxis=dict(showgrid=False, zeroline=False, visible=False),
+        yaxis=dict(showgrid=False, zeroline=False, visible=False),
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
 else:
     st.info("Enter a channel and click Analyze to load data.")
