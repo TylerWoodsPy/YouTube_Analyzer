@@ -19,3 +19,6 @@ models/
 
 #local saved csvs
 runs/
+
+#local saved images of project
+images/

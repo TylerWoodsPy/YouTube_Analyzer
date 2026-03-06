@@ -169,6 +169,74 @@ def search_video_ids(
     return video_ids[:max_results], total_results
 
 
+
+
+def search_videos_detailed(
+    q: str = None,
+    *,
+    query: str = None,
+    max_results: int = 50,
+    order: str = "relevance",
+    region_code: str = None,
+    relevance_language: str = None,
+    published_after=None,
+    published_before=None,
+):
+    """Search for videos and return (rows, totalResults).
+
+    Each row contains lightweight discovery fields from search.list so the app
+    can harvest channels without making a second expensive search call.
+    """
+    term = q if q is not None else query
+    if not term:
+        return [], 0
+
+    params = {
+        "q": term,
+        "part": "snippet",
+        "type": "video",
+        "order": order,
+        "maxResults": 50,
+    }
+    if region_code:
+        params["regionCode"] = region_code
+    if relevance_language:
+        params["relevanceLanguage"] = relevance_language
+
+    pa = _to_rfc3339(published_after)
+    pb = _to_rfc3339(published_before)
+    if pa:
+        params["publishedAfter"] = pa
+    if pb:
+        params["publishedBefore"] = pb
+
+    rows = []
+    request = youtube.search().list(**params)
+    response = request.execute()
+    total_results = response.get("pageInfo", {}).get("totalResults", 0)
+
+    while request and len(rows) < max_results:
+        for item in response.get("items", []):
+            vid = item.get("id", {}).get("videoId")
+            sn = item.get("snippet", {}) or {}
+            if not vid:
+                continue
+            rows.append({
+                "video_id": vid,
+                "channel_id": sn.get("channelId", ""),
+                "channel_title": sn.get("channelTitle", ""),
+                "title": sn.get("title", ""),
+                "published_at": sn.get("publishedAt", ""),
+            })
+            if len(rows) >= max_results:
+                break
+        request = youtube.search().list_next(request, response)
+        if request and len(rows) < max_results:
+            response = request.execute()
+
+    return rows[:max_results], total_results
+
+
 def related_video_ids(
     video_id: str,
     max_results: int = 25,

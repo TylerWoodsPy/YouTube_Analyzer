@@ -20,6 +20,7 @@ from yt_api import (fetch_videos_metadata,
     get_video_ids,
     get_video_stats,
     search_video_ids,
+    search_videos_detailed,
     related_video_ids,
 )
 
@@ -179,6 +180,35 @@ def _compute_trendline(ts: pd.DataFrame, y_col: str) -> pd.Series:
     intercept = (y_sum / n) - slope * (x_sum / n)
 
     return pd.Series((intercept + slope * x).values, index=ts.index)
+
+
+
+def _youtube_exportable_video_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Conservative allowlist for downloadable fields.
+
+    This intentionally excludes derived analytics columns such as engagement,
+    like_ratio, views_per_day, opportunity_score, regression outputs, and other
+    computed values so the app only exports raw-ish fields returned from the
+    API/warehouse.
+    """
+    allowed = [
+        "video_id",
+        "channel_id",
+        "title",
+        "published",
+        "published_at",
+        "duration_sec",
+        "views",
+        "likes",
+        "comments",
+    ]
+    keep = [c for c in allowed if c in df.columns]
+    out = df[keep].copy()
+    if "published_at" in out.columns and "published" not in out.columns:
+        out = out.rename(columns={"published_at": "published"})
+    if "published" in out.columns:
+        out["published"] = pd.to_datetime(out["published"], errors="coerce")
+    return out
 
 
 # -----------------------------
@@ -638,11 +668,13 @@ if "df" in st.session_state:
 
         st.dataframe(df_filt[show_cols].sort_values("views", ascending=False), use_container_width=True)
 
-        csv = df_filt.to_csv(index=False).encode("utf-8")
+        export_df = _youtube_exportable_video_columns(df_filt)
+        st.caption("CSV export is restricted to a conservative raw-field allowlist to avoid exporting derived analytics.")
+        csv = export_df.to_csv(index=False).encode("utf-8")
         st.download_button(
-            "Download CSV",
+            "Download raw video CSV",
             csv,
-            file_name="youtube_videos_filtered.csv",
+            file_name="youtube_videos_raw_filtered.csv",
             mime="text/csv"
         )
 
@@ -996,7 +1028,7 @@ if "df" in st.session_state:
                 published_after = dt.isoformat().replace("+00:00", "Z")
 
             with st.spinner("Searching videos..."):
-                base_ids, total_results = search_video_ids(
+                seed_rows, total_results = search_videos_detailed(
                     q=seed.strip(),
                     max_results=int(max_results),
                     order=order,
@@ -1005,7 +1037,25 @@ if "df" in st.session_state:
                     published_after=published_after,
                 )
 
+            base_ids = [r["video_id"] for r in seed_rows if r.get("video_id")]
             ids = list(base_ids)
+
+            seed_channel_df = pd.DataFrame(seed_rows)
+            if not seed_channel_df.empty:
+                seed_channel_df["channel_id"] = seed_channel_df["channel_id"].fillna("").astype(str)
+                seed_channel_df["channel_title"] = seed_channel_df["channel_title"].fillna("").astype(str)
+                seed_channel_df = seed_channel_df[seed_channel_df["channel_id"] != ""]
+                discovered_channels = (
+                    seed_channel_df.groupby(["channel_id", "channel_title"], as_index=False)
+                    .agg(
+                        hits=("video_id", "count"),
+                        sample_title=("title", "first"),
+                    )
+                    .sort_values(["hits", "channel_title"], ascending=[False, True])
+                    .reset_index(drop=True)
+                )
+            else:
+                discovered_channels = pd.DataFrame(columns=["channel_id", "channel_title", "hits", "sample_title"])
             edges = []  # (source_video_id, related_video_id)
             related_map = {}  # anchor_video_id -> [expanded_video_ids]
 
@@ -1127,6 +1177,30 @@ if "df" in st.session_state:
                 st.caption("Opportunity score = median_views_per_day / log10(totalResults). "
                            "This is a *proxy* score (not official search volume).")
 
+                st.markdown("### Discovered channels from this keyword")
+                if discovered_channels.empty:
+                    st.info("No channels were discovered from the current search results.")
+                else:
+                    channel_txt = "\n".join(discovered_channels["channel_id"].astype(str).tolist()) + "\n"
+                    ch_col1, ch_col2 = st.columns([2, 1])
+                    ch_col1.dataframe(
+                        discovered_channels[["channel_title", "channel_id", "hits", "sample_title"]],
+                        use_container_width=True,
+                        column_config={
+                            "channel_title": st.column_config.TextColumn("Channel"),
+                            "channel_id": st.column_config.TextColumn("Channel ID"),
+                            "hits": st.column_config.NumberColumn("Seed hits"),
+                            "sample_title": st.column_config.TextColumn("Example matched title"),
+                        },
+                    )
+                    ch_col2.caption("Direct file download is disabled here for stricter policy handling. Copy the channel IDs if you want to reuse them internally.")
+                    ch_col2.text_area(
+                        "Channel IDs",
+                        value=channel_txt,
+                        height=220,
+                        key="discovered_channel_ids_text",
+                    )
+
                 # --- Top videos table ---
                 st.markdown("### Top videos")
                 sort_metric = st.selectbox("Sort top videos by", ["views_per_day", "views", "age_days"], index=0)
@@ -1240,70 +1314,68 @@ if "df" in st.session_state:
 
                         if G.number_of_nodes() < 5:
                             st.info("Graph too small with current filters. Try increasing Max nodes or lowering the min views filter.")
-# Layout
-    pos = nx.spring_layout(G, k=0.45, iterations=75, seed=42)
+                        else:
+                            pos = nx.spring_layout(G, k=0.45, iterations=75, seed=42)
 
-    def _group(n: str) -> str:
-        if color_by == "channel":
-            return str(id_to_channel.get(n, "—"))
-        if color_by == "top_phrase":
-            return str(id_to_phrase.get(n, "—"))
-        return "—"
+                            def _group(n: str) -> str:
+                                if color_by == "channel":
+                                    return str(id_to_channel.get(n, "—"))
+                                if color_by == "top_phrase":
+                                    return str(id_to_phrase.get(n, "—"))
+                                return "—"
 
-    groups = [_group(n) for n in G.nodes()]
-    uniq = {g: i for i, g in enumerate(sorted(set(groups)))}
-    node_color = [uniq[g] for g in groups]
+                            groups = [_group(n) for n in G.nodes()]
+                            uniq = {g: i for i, g in enumerate(sorted(set(groups)))}
+                            node_color = [uniq[g] for g in groups]
 
-    # Edges trace
-    edge_x, edge_y = [], []
-    for s_, t_ in G.edges():
-        x0, y0 = pos[s_]
-        x1, y1 = pos[t_]
-        edge_x += [x0, x1, None]
-        edge_y += [y0, y1, None]
+                            edge_x, edge_y = [], []
+                            for s_, t_ in G.edges():
+                                x0, y0 = pos[s_]
+                                x1, y1 = pos[t_]
+                                edge_x += [x0, x1, None]
+                                edge_y += [y0, y1, None]
 
-    edge_trace = go.Scatter(
-        x=edge_x,
-        y=edge_y,
-        mode="lines",
-        line=dict(width=1),
-        hoverinfo="none",
-    )
+                            edge_trace = go.Scatter(
+                                x=edge_x,
+                                y=edge_y,
+                                mode="lines",
+                                line=dict(width=1),
+                                hoverinfo="none",
+                            )
 
-    # Nodes trace
-    node_x, node_y, node_text, node_size = [], [], [], []
-    for n in G.nodes():
-        x, y = pos[n]
-        node_x.append(x)
-        node_y.append(y)
-        title_ = id_to_title.get(n, n)
-        ch_ = id_to_channel.get(n, "—")
-        views_ = int(id_to_views.get(n, 0) or 0)
-        node_text.append(f"{title_}<br>{ch_}<br>Views: {views_:,}")
-        node_size.append(max(8, min(35, float(np.log1p(views_)) * 2)))
+                            node_x, node_y, node_text, node_size = [], [], [], []
+                            for n in G.nodes():
+                                x, y = pos[n]
+                                node_x.append(x)
+                                node_y.append(y)
+                                title_ = id_to_title.get(n, n)
+                                ch_ = id_to_channel.get(n, "—")
+                                views_ = int(id_to_views.get(n, 0) or 0)
+                                node_text.append(f"{title_}<br>{ch_}<br>Views: {views_:,}")
+                                node_size.append(max(8, min(35, float(np.log1p(views_)) * 2)))
 
-    node_trace = go.Scatter(
-        x=node_x,
-        y=node_y,
-        mode="markers",
-        hoverinfo="text",
-        text=node_text,
-        marker=dict(
-            size=node_size,
-            color=node_color,
-            showscale=True,
-            colorbar=dict(title=color_by),
-        ),
-    )
+                            node_trace = go.Scatter(
+                                x=node_x,
+                                y=node_y,
+                                mode="markers",
+                                hoverinfo="text",
+                                text=node_text,
+                                marker=dict(
+                                    size=node_size,
+                                    color=node_color,
+                                    showscale=True,
+                                    colorbar=dict(title=color_by),
+                                ),
+                            )
 
-    fig = go.Figure(data=[edge_trace, node_trace])
-    fig.update_layout(
-        showlegend=False,
-        margin=dict(l=10, r=10, t=10, b=10),
-        xaxis=dict(showgrid=False, zeroline=False, visible=False),
-        yaxis=dict(showgrid=False, zeroline=False, visible=False),
-    )
-    st.plotly_chart(fig, use_container_width=True)
+                            fig = go.Figure(data=[edge_trace, node_trace])
+                            fig.update_layout(
+                                showlegend=False,
+                                margin=dict(l=10, r=10, t=10, b=10),
+                                xaxis=dict(showgrid=False, zeroline=False, visible=False),
+                                yaxis=dict(showgrid=False, zeroline=False, visible=False),
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
 
 else:
     st.info("Enter a channel and click Analyze to load data.")

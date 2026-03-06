@@ -1,5 +1,5 @@
 """
-train_models_dual.py
+train_models_cleaned.py
 
 Offline model benchmarking + hyperparameter tuning that produces TWO best models:
 
@@ -10,14 +10,16 @@ Also writes leaderboards:
 - runs/<timestamp>_per_channel_time.csv
 - runs/<timestamp>_channel_holdout.csv
 
-Each saved bundle includes baseline context so you can compare MAE to baselines:
-- mean_baseline_views
-- median_baseline_views
-- mae_over_mean_baseline
+Cleaned-up version:
+- removes Ridge / ElasticNet to avoid warning spam on this feature set
+- keeps strong tabular contenders only: HistGBR, RandomForest, ExtraTrees
+- optionally benchmarks XGBoost on CPU and/or NVIDIA GPU
+- prints a compact model summary for each split so you can confirm GPU ran
 
-Run:
-  python train_models_dual.py --trials 50 --baseline-n 10 15
-  python train_models_dual.py --trials 100 --baseline-n 10 15 20 --use-post
+Examples:
+  python train_models_cleaned.py --trials 50 --baseline-n 10 15
+  python train_models_cleaned.py --trials 50 --baseline-n 10 15 --gpu
+  python train_models_cleaned.py --trials 50 --baseline-n 10 15 --xgb --gpu
 """
 
 from __future__ import annotations
@@ -32,12 +34,15 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from sklearn.base import RegressorMixin
-from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor, HistGradientBoostingRegressor
+from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor, RandomForestRegressor
 from sklearn.inspection import permutation_importance
-from sklearn.linear_model import Ridge, ElasticNet
 from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
 from sklearn.model_selection import train_test_split
+
+try:
+    from xgboost import XGBRegressor
+except Exception:
+    XGBRegressor = None
 
 from db import load_all_videos_df
 from model_views import build_feature_frame
@@ -86,7 +91,6 @@ def split_train_test(
         train_ch, test_ch = train_test_split(channels, test_size=channel_test_frac, random_state=seed)
         return df[df["channel_id"].isin(train_ch)].copy(), df[df["channel_id"].isin(test_ch)].copy()
 
-    # per_channel_time
     d = df.copy()
     d["row_in_channel"] = d.groupby("channel_id").cumcount()
     d["n_in_channel"] = d.groupby("channel_id")["views"].transform("count")
@@ -106,12 +110,14 @@ class BestTrial:
     seed: int
     feature_names: List[str]
     metrics: Dict[str, float]
-    model: RegressorMixin
+    model: Any
     perm_importance: Optional[pd.DataFrame]
 
 
-# ---- Model samplers (sklearn-only)
-def sample_hgbr(rng: np.random.Generator, seed: int) -> Tuple[str, RegressorMixin, Dict[str, Any]]:
+# -----------------------
+# Model samplers
+# -----------------------
+def sample_hgbr(rng: np.random.Generator, seed: int) -> Tuple[str, Any, Dict[str, Any]]:
     params = {
         "learning_rate": log_uniform(rng, 0.01, 0.2),
         "max_depth": int(rng.integers(3, 11)),
@@ -123,7 +129,7 @@ def sample_hgbr(rng: np.random.Generator, seed: int) -> Tuple[str, RegressorMixi
     return "HistGBR", HistGradientBoostingRegressor(**params), params
 
 
-def sample_rf(rng: np.random.Generator, seed: int, n_jobs: int) -> Tuple[str, RegressorMixin, Dict[str, Any]]:
+def sample_rf(rng: np.random.Generator, seed: int, n_jobs: int) -> Tuple[str, Any, Dict[str, Any]]:
     max_depth = rng.choice([None] + list(range(6, 31)))
     params = {
         "n_estimators": int(rng.integers(200, 1201)),
@@ -136,7 +142,7 @@ def sample_rf(rng: np.random.Generator, seed: int, n_jobs: int) -> Tuple[str, Re
     return "RandomForest", RandomForestRegressor(**params), params
 
 
-def sample_et(rng: np.random.Generator, seed: int, n_jobs: int) -> Tuple[str, RegressorMixin, Dict[str, Any]]:
+def sample_et(rng: np.random.Generator, seed: int, n_jobs: int) -> Tuple[str, Any, Dict[str, Any]]:
     max_depth = rng.choice([None] + list(range(6, 31)))
     params = {
         "n_estimators": int(rng.integers(300, 1601)),
@@ -149,24 +155,56 @@ def sample_et(rng: np.random.Generator, seed: int, n_jobs: int) -> Tuple[str, Re
     return "ExtraTrees", ExtraTreesRegressor(**params), params
 
 
-def sample_ridge(rng: np.random.Generator, seed: int) -> Tuple[str, RegressorMixin, Dict[str, Any]]:
-    alpha = log_uniform(rng, 0.1, 200.0)
-    return "Ridge", Ridge(alpha=alpha), {"alpha": alpha}
-
-
-def sample_enet(rng: np.random.Generator, seed: int) -> Tuple[str, RegressorMixin, Dict[str, Any]]:
+def sample_xgb_cpu(rng: np.random.Generator, seed: int, n_jobs: int) -> Tuple[str, Any, Dict[str, Any]]:
+    if XGBRegressor is None:
+        raise ImportError("xgboost is not installed. Add xgboost to requirements and pip install it.")
     params = {
-        "alpha": log_uniform(rng, 1e-4, 5.0),
-        "l1_ratio": float(rng.uniform(0.05, 0.95)),
-        "max_iter": 5000,
+        "n_estimators": int(rng.integers(250, 1501)),
+        "max_depth": int(rng.integers(3, 11)),
+        "learning_rate": log_uniform(rng, 0.01, 0.2),
+        "subsample": float(rng.uniform(0.6, 1.0)),
+        "colsample_bytree": float(rng.uniform(0.5, 1.0)),
+        "min_child_weight": float(log_uniform(rng, 0.5, 20.0)),
+        "reg_alpha": float(log_uniform(rng, 1e-6, 10.0)),
+        "reg_lambda": float(log_uniform(rng, 1e-4, 20.0)),
+        "gamma": float(log_uniform(rng, 1e-6, 5.0)),
+        "objective": "reg:squarederror",
+        "tree_method": "hist",
         "random_state": seed,
+        "n_jobs": n_jobs,
+        "verbosity": 0,
     }
-    return "ElasticNet", ElasticNet(**params), params
+    return "XGBoost_CPU", XGBRegressor(**params), params
 
 
+def sample_xgb_gpu(rng: np.random.Generator, seed: int) -> Tuple[str, Any, Dict[str, Any]]:
+    if XGBRegressor is None:
+        raise ImportError("xgboost is not installed. Add xgboost to requirements and pip install it.")
+    params = {
+        "n_estimators": int(rng.integers(250, 1501)),
+        "max_depth": int(rng.integers(3, 11)),
+        "learning_rate": log_uniform(rng, 0.01, 0.2),
+        "subsample": float(rng.uniform(0.6, 1.0)),
+        "colsample_bytree": float(rng.uniform(0.5, 1.0)),
+        "min_child_weight": float(log_uniform(rng, 0.5, 20.0)),
+        "reg_alpha": float(log_uniform(rng, 1e-6, 10.0)),
+        "reg_lambda": float(log_uniform(rng, 1e-4, 20.0)),
+        "gamma": float(log_uniform(rng, 1e-6, 5.0)),
+        "objective": "reg:squarederror",
+        "tree_method": "hist",
+        "device": "cuda",
+        "random_state": seed,
+        "verbosity": 0,
+    }
+    return "XGBoost_GPU", XGBRegressor(**params), params
+
+
+# -----------------------
+# Fit + score
+# -----------------------
 def fit_score_one(
     feature_df: pd.DataFrame,
-    model: RegressorMixin,
+    model: Any,
     feats: List[str],
     split_mode: str,
     test_frac_per_channel: float,
@@ -182,13 +220,13 @@ def fit_score_one(
     if train.empty or test.empty:
         raise ValueError(f"Empty split: train={len(train)} test={len(test)} (mode={split_mode})")
 
-    X_train = train[feats].fillna(0.0).to_numpy(dtype=float)
-    y_train = train["y"].to_numpy(dtype=float)
-    X_test = test[feats].fillna(0.0).to_numpy(dtype=float)
-    y_test = test["y"].to_numpy(dtype=float)
+    X_train = train[feats].fillna(0.0).to_numpy(dtype=np.float32)
+    y_train = train["y"].to_numpy(dtype=np.float32)
+    X_test = test[feats].fillna(0.0).to_numpy(dtype=np.float32)
+    y_test = test["y"].to_numpy(dtype=np.float32)
 
     model.fit(X_train, y_train)
-    yhat = model.predict(X_test)
+    yhat = np.asarray(model.predict(X_test), dtype=float)
 
     pr_true = np.expm1(y_test)
     pr_pred = clip_ratio(np.expm1(yhat), 0.0, ratio_clip_hi)
@@ -243,6 +281,9 @@ def fit_score_one(
     return metrics, perm_df
 
 
+# -----------------------
+# Search loop
+# -----------------------
 def tune_for_split(
     all_videos: pd.DataFrame,
     split_mode: str,
@@ -258,6 +299,8 @@ def tune_for_split(
     metric: str,
     n_jobs: int,
     rng: np.random.Generator,
+    include_xgb_cpu: bool,
+    include_xgb_gpu: bool,
 ) -> Tuple[pd.DataFrame, Optional[BestTrial], float]:
     rows: List[Dict[str, Any]] = []
     best: Optional[BestTrial] = None
@@ -267,14 +310,19 @@ def tune_for_split(
         lambda: sample_hgbr(rng, seed),
         lambda: sample_rf(rng, seed, n_jobs),
         lambda: sample_et(rng, seed, n_jobs),
-        lambda: sample_ridge(rng, seed),
-        lambda: sample_enet(rng, seed),
     ]
+
+    if include_xgb_cpu:
+        samplers.append(lambda: sample_xgb_cpu(rng, seed, n_jobs))
+    if include_xgb_gpu:
+        samplers.append(lambda: sample_xgb_gpu(rng, seed))
 
     trial_id = 0
     for baseline_n in baseline_ns:
         feat_df = build_feature_frame(all_videos, baseline_n=baseline_n)
         feats = get_feature_list(use_post=use_post)
+
+        print(f"  baseline_n={baseline_n} | usable rows={len(feat_df):,} | models={len(samplers)}")
 
         for _ in range(trials * len(samplers)):
             trial_id += 1
@@ -351,13 +399,44 @@ def save_bundle(best: BestTrial, out_path: str, metric: str, best_score: float, 
             "seed": best.seed,
             "metric": metric,
             "ratio_clip_hi": ratio_clip_hi,
+            "best_score": best_score,
         },
         "saved_at": datetime.now().isoformat(timespec="seconds"),
     }
     joblib.dump(bundle, out_path)
 
 
-def main():
+def print_model_summary(df_out: pd.DataFrame, metric: str) -> None:
+    ok_df = df_out[df_out["ok"] == 1].copy()
+    if ok_df.empty:
+        print("No successful trials to summarize.")
+        return
+
+    summary = (
+        ok_df.groupby("model", as_index=False)
+        .agg(
+            trials=("model", "count"),
+            best_score=("score", "min"),
+            median_score=("score", "median"),
+        )
+        .sort_values("best_score", ascending=True)
+        .reset_index(drop=True)
+    )
+
+    print(f"\nModel summary by best {metric}:")
+    for _, row in summary.iterrows():
+        print(
+            f"  {row['model']:<14} "
+            f"best={row['best_score']:>12,.2f} "
+            f"median={row['median_score']:>12,.2f} "
+            f"trials={int(row['trials'])}"
+        )
+
+
+# -----------------------
+# Main
+# -----------------------
+def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--trials", type=int, default=50, help="Trials per model family, per baseline_n.")
     ap.add_argument("--baseline-n", type=int, nargs="+", default=[10, 15], help="Baseline windows to try.")
@@ -370,7 +449,12 @@ def main():
     ap.add_argument("--ratio-clip-hi", type=float, default=50.0)
     ap.add_argument("--metric", choices=["MAE_views", "MAPE_views"], default="MAE_views")
     ap.add_argument("--n-jobs", type=int, default=-1)
+    ap.add_argument("--xgb", action="store_true", help="Include CPU XGBoost trials.")
+    ap.add_argument("--gpu", action="store_true", help="Include GPU XGBoost trials.")
     args = ap.parse_args()
+
+    if (args.xgb or args.gpu) and XGBRegressor is None:
+        raise SystemExit("xgboost is not installed. Add it to requirements and pip install -r requirements.txt first.")
 
     os.makedirs("models", exist_ok=True)
     os.makedirs("runs", exist_ok=True)
@@ -379,6 +463,14 @@ def main():
     all_videos = load_all_videos_df()
     if all_videos.empty:
         raise SystemExit("No videos found in DB yet. Harvest/analyze at least one channel first.")
+
+    print(f"Rows loaded: {len(all_videos):,}")
+    print("Model pool:")
+    print("  - HistGBR")
+    print("  - RandomForest")
+    print("  - ExtraTrees")
+    print(f"  - XGBoost CPU: {'ON' if args.xgb else 'OFF'}")
+    print(f"  - XGBoost GPU: {'ON' if args.gpu else 'OFF'}")
 
     rng = np.random.default_rng(args.seed)
     run_id = now_tag()
@@ -403,10 +495,13 @@ def main():
             metric=args.metric,
             n_jobs=args.n_jobs,
             rng=rng,
+            include_xgb_cpu=bool(args.xgb),
+            include_xgb_gpu=bool(args.gpu),
         )
 
         df_out.to_csv(out_csv, index=False)
         print(f"Wrote leaderboard: {out_csv}")
+        print_model_summary(df_out, args.metric)
 
         if best is None:
             print("No successful trials for this split.")
@@ -414,12 +509,16 @@ def main():
 
         save_bundle(best, out_model, args.metric, best_score, args.ratio_clip_hi)
         m = best.metrics
-        print(f"Saved best model: {out_model}")
-        print(f"Best: {best.model_name} baseline_n={best.baseline_n} use_post={best.use_post} "
-              f"{args.metric}={best_score:,.2f}")
-        print(f"Test mean views: {m.get('mean_views_test', float('nan')):,.0f} | "
-              f"mean baseline: {m.get('mean_baseline_views', float('nan')):,.0f} | "
-              f"MAE/mean baseline: {m.get('mae_over_mean_baseline', float('nan')):.2f}×")
+        print(f"\nSaved best model: {out_model}")
+        print(
+            f"Best: {best.model_name} baseline_n={best.baseline_n} use_post={best.use_post} "
+            f"{args.metric}={best_score:,.2f}"
+        )
+        print(
+            f"Test mean views: {m.get('mean_views_test', float('nan')):,.0f} | "
+            f"mean baseline: {m.get('mean_baseline_views', float('nan')):,.0f} | "
+            f"MAE/mean baseline: {m.get('mae_over_mean_baseline', float('nan')):.2f}×"
+        )
 
     print("\nDone.")
 
