@@ -1,287 +1,510 @@
-# ChannelScope --- YouTube Intelligence Platform
+# ChannelScope — YouTube Intelligence Platform
 
 *(YouTube Channel Analyzer)*
 
-A local YouTube analytics and machine learning lab combining:
+A local YouTube analytics and machine learning project that combines:
 
--   Incremental YouTube Data API ingestion
--   Normalized SQLite analytics warehouse
--   Batch harvesting from custom channel lists
--   Leakage-safe feature engineering
--   Offline model training & benchmarking
--   Public keyword intelligence & topic exploration
--   Streamlit dashboard for BI + model serving
+- Incremental YouTube Data API ingestion
+- Normalized SQLite storage for channel and video analytics
+- Batch harvesting from custom channel lists
+- Snapshot-based growth and velocity tracking
+- Leakage-safe feature engineering for view prediction
+- Offline model benchmarking and saving
+- Public keyword intelligence and topic exploration
+- Streamlit dashboard for analytics, discovery, and model inference
 
-------------------------------------------------------------------------
+---
 
 # 🏗 Architecture Overview
 
-The system is intentionally structured like a miniature analytics stack:
+The project is structured like a lightweight analytics stack:
 
-    Ingestion → Storage → Feature Engineering → Offline Training → Model Serving
+```text
+Ingestion → Storage → Feature Engineering → Offline Training → Model Serving
+```
 
-Model experimentation is separated from the Streamlit UI.
+The Streamlit app is used for exploration, visualization, keyword research, and loading saved models.
+Heavy model experimentation is kept offline in `train_models.py`.
 
-Two predictive models are trained and saved:
+The project supports two main predictive model targets:
 
--   **Per-channel future prediction**
--   **Cross-channel generalization (channel holdout)**
+- **Per-channel future prediction**
+- **Cross-channel generalization**
 
-The platform also includes a public **YouTube search intelligence
-layer** for analyzing keywords and topic ecosystems.
+It also includes a public **keyword intelligence layer** for analyzing search results, phrases, and topic ecosystems.
 
-------------------------------------------------------------------------
+---
 
 # 📁 Project Structure
 
-    youtube_analyzer/
-    │
-    ├── app.py
-    │   └── Streamlit analytics dashboard + keyword intelligence
-    │
-    ├── harvest.py
-    │   └── Batch ingestion from .txt channel list
-    │
-    ├── train_models.py
-    │   └── Offline model comparison, hyperparameter search, and model selection
-    │
-    ├── model_views.py
-    │   ├── Leakage-safe feature engineering
-    │   ├── Rolling channel baseline features
-    │   └── Channel-aware training splits
-    │
-    ├── yt_api.py
-    │   ├── YouTube Data API ingestion
-    │   ├── Keyword search helpers
-    │   └── Related video discovery
-    │
-    ├── transform.py
-    │   └── API → normalized dataframe transforms
-    │
-    ├── db.py
-    │   └── SQLite schema & analytics warehouse utilities
-    │
-    ├── models/
-    │   └── saved model bundles (.joblib)
-    │
-    ├── runs/
-    │   └── experiment leaderboards
-    │
-    ├── channels.txt
-    └── requirements.txt
+```text
+youtube_analyzer/
+│
+├── app.py
+│   └── Streamlit dashboard for analytics, growth tracking, keyword intel, and model inference
+│
+├── harvest.py
+│   └── Batch ingestion from a .txt list of channel IDs, handles, or names
+│
+├── train_models.py
+│   └── Offline model benchmarking, hyperparameter search, and best-model export
+│
+├── model_views.py
+│   ├── Leakage-safe feature engineering
+│   ├── Rolling channel baseline features
+│   └── Channel-aware train/test logic
+│
+├── yt_api.py
+│   ├── YouTube Data API helpers
+│   ├── Search and keyword intel helpers
+│   ├── Related video discovery fallback
+│   └── Metadata lookup helpers for graph enrichment
+│
+├── transform.py
+│   └── API → normalized row/dataframe transforms
+│
+├── db.py
+│   └── SQLite schema, warehouse utilities, and snapshot delta queries
+│
+├── models/
+│   └── Saved model bundles (.joblib)
+│
+├── runs/
+│   └── Training leaderboards and experiment outputs
+│
+├── channels.txt
+└── requirements.txt
+```
 
-------------------------------------------------------------------------
+---
+
+# ⚙️ Requirements
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Main libraries used:
+
+- `streamlit`
+- `pandas`
+- `plotly`
+- `google-api-python-client`
+- `python-dotenv`
+- `isodate`
+- `scikit-learn`
+- `joblib`
+- `numpy`
+- `requests`
+- `networkx`
+- `xgboost`
+
+---
+
+# 🔑 Setup
+
+Create a `.env` file in the project root:
+
+```env
+YOUTUBE_API_KEY=your_api_key_here
+```
+
+Then launch the dashboard:
+
+```bash
+streamlit run app.py
+```
+
+---
 
 # 🚀 Batch Harvesting
 
-Create `channels.txt`:
+Create a plain text file like `channels.txt`:
 
-    @veritasium
-    @Kurzgesagt
-    UCsooa4yRKGN_zEE8iknghZA
+```text
+@veritasium
+@Kurzgesagt
+UCsooa4yRKGN_zEE8iknghZA
+```
 
-Run harvesting:
+Then run harvesting:
 
-    python harvest.py channels.txt --mode incremental --max-videos 200
+```bash
+python harvest.py channels.txt --mode incremental --max-videos 200
+```
 
-### Options
+Example options:
 
-  Option                 Description
-  ---------------------- ----------------------------------
-  `--mode incremental`   Stop when hitting known videos\
-  `--mode full`          Always pull newest N videos\
-  `--ttl-hours`          Skip recently refreshed channels\
-  `--force`              Override TTL protection
+```bash
+python harvest.py channels.txt --ttl-hours 12
+python harvest.py channels.txt --force --max-videos 200
+python harvest.py channels.txt --mode full --max-videos 500
+```
 
-Harvest updates:
+## Harvest behavior
 
--   channels table
--   videos table
--   snapshot history
+The harvester supports:
 
-Snapshots allow **velocity analysis and growth tracking**.
+- `UC...` channel IDs
+- `@handle` inputs
+- channel names / search queries
+- YouTube channel URLs
 
-------------------------------------------------------------------------
+It updates:
+
+- `channels`
+- `videos`
+- `video_snapshots`
+- `fetch_log`
+
+## Modes
+
+| Option | Description |
+|---|---|
+| `--mode incremental` | Stops when known video IDs are reached |
+| `--mode full` | Pulls the newest N videos regardless |
+| `--ttl-hours` | Skips channels refreshed recently |
+| `--force` | Bypasses TTL protection |
+| `--sleep` | Optional pause between channels |
+
+Snapshots make **growth and velocity analysis** possible later inside the dashboard.
+
+---
+
+# 🗃 Database Design
+
+The SQLite database stores:
+
+- channel-level stats
+- normalized video records
+- repeated video snapshots over time
+- fetch timestamps for TTL-based refresh control
+
+Core tables:
+
+```text
+channels
+videos
+video_snapshots
+fetch_log
+```
+
+This lets the app support both current-state reporting and time-based growth analysis.
+
+---
+
+# 📈 Streamlit Dashboard Features
+
+Run the app with:
+
+```bash
+streamlit run app.py
+```
+
+Main tabs currently include:
+
+- **Overview**
+- **Performance**
+- **Relationships**
+- **Winners & Outliers**
+- **Growth & Velocity**
+- **Keyword Intel**
+- **Predict Views**
+- **Table**
+
+## Dashboard capabilities
+
+### Channel analytics
+
+- Refreshes a channel from the API or loads it from SQLite
+- Supports TTL-based refreshes or forced refreshes
+- Filters videos by preset or custom date ranges
+- Charts views over time with rolling averages and trend lines
+
+### Performance analysis
+
+- Top video ranking by views
+- Upload cadence over time
+- Views vs engagement relationship chart
+- Duration vs views comparison
+
+### Winners & Outliers
+
+A simple expectation model compares actual performance to expected performance using:
+
+- video age
+- duration
+- engagement
+
+This highlights:
+
+- overperformers
+- underperformers
+- actual vs expected view behavior
+
+### Growth & Velocity
+
+Using repeated snapshots, the app can measure:
+
+- view deltas
+- views per day
+- recent movers
+- snapshot coverage quality
+
+### Table + export controls
+
+The table tab supports filtering visible columns and downloading a CSV.
+
+CSV export is intentionally restricted to a conservative raw-field allowlist such as:
+
+- `video_id`
+- `channel_id`
+- `title`
+- `published`
+- `duration_sec`
+- `views`
+- `likes`
+- `comments`
+
+Derived analytics columns are excluded from export.
+
+---
+
+# 🔎 Keyword Intelligence
+
+The **Keyword Intel** tab uses public YouTube search data to analyze a topic or query.
+
+It supports:
+
+- keyword search via YouTube Data API
+- sorting by relevance, views, date, or rating
+- optional region and language filters
+- optional recent-date filter
+- views-per-day estimation
+- tag frequency analysis when available
+- common title phrase extraction
+- discovered channel summaries from the search results
+
+## Opportunity proxy
+
+The app calculates a simple opportunity score:
+
+```text
+opportunity_score = median_views_per_day / log10(total_results)
+```
+
+This is a **proxy metric**, not official search volume.
+It is meant to help compare topics that appear to have relatively strong performance against their visible competition.
+
+## Topic ecosystem graph
+
+The keyword tab can also build a topic ecosystem graph.
+
+Features include:
+
+- expansion from top anchor videos
+- related-video neighborhood discovery
+- graph node sizing by views
+- optional coloring by channel or phrase
+- graph enrichment using fetched metadata
+
+This makes it easier to explore clusters, adjacent topics, and likely content neighborhoods.
+
+---
 
 # 🧠 Machine Learning System
 
-## Target
+The prediction workflow is baseline-aware.
 
-The model predicts:
+Instead of predicting raw views directly, the system models:
 
-    log1p( views / rolling_channel_baseline )
+```text
+log1p(views / rolling_channel_baseline)
+```
 
-Converted back into view predictions:
+That prediction is converted back into views with:
 
-    predicted_views = baseline × predicted_ratio
+```text
+predicted_views = baseline × predicted_ratio
+```
 
-This normalization stabilizes training across channels with very
-different audience sizes.
+This helps stabilize training across channels with very different sizes and performance ranges.
 
-------------------------------------------------------------------------
+---
 
-# 🏋 Offline Model Training
+# 🏋️ Offline Model Training
 
-Run training:
+Train models offline with:
 
-    python train_models.py --trials 50 --baseline-n 10 15
+```bash
+python train_models.py --trials 50 --baseline-n 10 15
+```
 
-Optional example:
+Example with CPU and GPU XGBoost enabled:
 
-    python train_models.py --trials 100 --baseline-n 10 15 20
+```bash
+python train_models.py --trials 50 --baseline-n 10 15 --xgb --gpu
+```
 
-Training pipeline:
+Another example with a wider baseline sweep:
 
-1.  Load all videos from SQLite
-2.  Build leakage-safe feature frames
-3.  Evaluate multiple model families
-4.  Run hyperparameter searches
-5.  Benchmark across split strategies
-6.  Write experiment leaderboards
-7.  Save the best performing models
+```bash
+python train_models.py --trials 100 --baseline-n 10 15 20
+```
 
-Saved outputs:
+## Training workflow
 
-    models/best_per_channel.joblib
-    models/best_channel_holdout.joblib
+The training script:
 
-Leaderboards are written to:
+1. Loads all videos from SQLite
+2. Builds leakage-safe feature frames
+3. Tries multiple model families
+4. Benchmarks across split strategies
+5. Writes leaderboard CSV files
+6. Saves the best models to `models/`
 
-    runs/<timestamp>_leaderboard.csv
+## Model families
 
-Each saved model bundle includes:
+Current training pool includes:
 
--   trained model
--   feature names
--   evaluation metrics
--   permutation feature importance
--   baseline diagnostics
--   training configuration
+- `HistGradientBoostingRegressor`
+- `RandomForestRegressor`
+- `ExtraTreesRegressor`
+- `XGBoost` on CPU (optional)
+- `XGBoost` on GPU (optional)
 
-------------------------------------------------------------------------
+## Saved outputs
+
+```text
+models/best_per_channel.joblib
+models/best_channel_holdout.joblib
+```
+
+Leaderboard files are written to:
+
+```text
+runs/<timestamp>_per_channel_time.csv
+runs/<timestamp>_channel_holdout.csv
+```
+
+Each saved bundle includes:
+
+- trained model
+- feature names
+- evaluation metrics
+- permutation feature importance
+- configuration used for training
+- save timestamp
+
+---
 
 # 🧪 Split Modes
 
-### per_channel_time
+## `per_channel_time`
 
-Train on earlier videos and test on later uploads within each channel.
+Trains on earlier uploads and tests on later uploads from the same channels.
 
-Used to evaluate **future prediction performance for known creators**.
+Use this when the goal is:
 
-### channel_holdout
+- forecasting future videos for channels already represented in the dataset
 
-Train on some channels and test on completely unseen channels.
+## `channel_holdout`
 
-Used to evaluate **ecosystem-level generalization**.
+Trains on one group of channels and tests on completely unseen channels.
 
-------------------------------------------------------------------------
+Use this when the goal is:
 
-# 📊 Baseline-Aware Evaluation
+- measuring cross-channel generalization
+- testing how portable the model is to new creators
 
-Stored metrics include:
+---
 
-    MAE_views
-    MAPE_views
-    MAE_ratio
-    MAPE_ratio
-    mean_views_test
-    mean_baseline_views
-    mae_over_mean_baseline
+# 🧬 Feature Engineering Highlights
 
-These metrics help interpret model performance relative to channel size.
+The feature pipeline includes a mix of content, timing, and channel-history features such as:
 
-------------------------------------------------------------------------
+- log duration
+- title length and word count
+- uppercase / digit / punctuation ratios
+- title sentiment score
+- publish hour / weekday / month
+- days since previous upload
+- previous video engagement features
+- rolling channel view baselines
+- rolling duration and title-length baselines
+- channel trend slope
+- short-form indicator
 
-# 🔎 Keyword Intelligence System
+Optional post-publish features can also be included during offline experiments.
 
-The **Keyword Intel** module analyzes public YouTube search results to
-identify content opportunities.
+---
 
-Features:
+# 📊 Evaluation Metrics
 
--   Keyword search via YouTube Data API
--   Competition estimation via search result counts
--   Views-per-day velocity metrics
--   Phrase extraction from titles
--   Tag frequency analysis
--   Topic exploration using related videos
--   Interactive graph visualization for exploring topic connections
+Stored metrics include values such as:
 
-Optional expansion mode:
+```text
+MAE_views
+MAPE_views
+MAE_ratio
+MAPE_ratio
+mean_views_test
+median_views_test
+mean_baseline_views
+median_baseline_views
+mae_over_mean_baseline
+```
 
-1.  Select top performing videos
-2.  Explore their related video graph
-3.  Visualize topic clusters and connections
-4.  Build a local topic ecosystem dataset
+These metrics help you interpret model performance relative to channel scale, not just raw error alone.
 
-Opportunity score proxy:
+---
 
-    opportunity_score = median_views_per_day / log10(total_results)
+# 🔮 Predict Views in the App
 
-This helps identify topics with **high performance but relatively low
-competition**.
+The **Predict Views** tab can load saved offline-trained models and provide quick pre-publish estimates.
 
-------------------------------------------------------------------------
+That tab supports:
 
-# 🖥 Streamlit Dashboard
+- loading both saved model bundles
+- switching between per-channel and holdout models
+- showing evaluation summaries
+- showing permutation importance when available
+- estimating predicted views for a planned next upload
 
-Run the application:
+The pre-publish estimate uses planned inputs like:
 
-    streamlit run app.py
+- title
+- duration
+- publish date
+- publish hour
+- recent channel baseline
 
-Main dashboard sections:
-
--   Overview
--   Performance
--   Relationships
--   Winners & Outliers
--   Growth & Velocity
--   Keyword Intelligence
--   Predict Views
--   Data Table
-
-The dashboard performs:
-
--   analytics
--   model inference
--   keyword intelligence
-
-Heavy model training is done **offline**.
-
-------------------------------------------------------------------------
-
-# 📈 Growth & Snapshot Tracking
-
-Snapshot history records:
-
-    views
-    likes
-    comments
-
-Each snapshot enables:
-
--   velocity calculation
--   growth tracking
--   trend detection
-
-Example metric:
-
-    views_per_day = views_delta / days_delta
-
-------------------------------------------------------------------------
+---
 
 # 🎯 Design Philosophy
 
-This project simulates a **real analytics + ML stack**:
+This project is designed like a compact real-world analytics and ML stack:
 
--   warehouse-first modeling
--   leakage-safe ML features
--   channel-aware evaluation
--   offline experimentation workflow
--   lightweight model serving
--   hybrid **data engineering + ML portfolio project**
+- warehouse-first workflow
+- incremental ingestion
+- snapshot-aware analytics
+- leakage-safe training features
+- channel-aware validation logic
+- offline experimentation with lightweight serving
+- public search intelligence layered on top of owned local storage
 
-------------------------------------------------------------------------
+It works well as a portfolio project because it combines:
+
+- data ingestion
+- storage design
+- business intelligence
+- exploratory analytics
+- machine learning experimentation
+- lightweight application delivery
+
+---
 
 # License
 

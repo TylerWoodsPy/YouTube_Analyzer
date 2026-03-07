@@ -1,4 +1,3 @@
-# model_views.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -13,6 +12,21 @@ from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
 from sklearn.model_selection import train_test_split
 
 
+_POSITIVE_WORDS = {
+    "best", "better", "win", "wins", "winning", "amazing", "awesome", "insane",
+    "huge", "massive", "fast", "faster", "ultimate", "perfect", "easy", "easier",
+    "success", "successful", "love", "great", "crazy", "smart", "strong", "pro",
+    "elite", "broken", "op", "god", "legendary", "top", "ranked", "new",
+}
+
+_NEGATIVE_WORDS = {
+    "worst", "bad", "terrible", "awful", "hard", "hardest", "hate", "brokenhearted",
+    "fail", "failed", "failing", "mistake", "problem", "problems", "wrong", "slow",
+    "slower", "weak", "nerf", "dead", "dying", "lost", "loss", "scam", "warning",
+    "avoid", "impossible", "never",
+}
+
+
 @dataclass
 class TrainResult:
     model: HistGradientBoostingRegressor
@@ -24,6 +38,72 @@ class TrainResult:
 def _safe_div(a: pd.Series, b: pd.Series) -> pd.Series:
     b2 = b.replace(0, np.nan)
     return a / b2
+
+
+def _tokenize_title(s: str) -> list[str]:
+    import re
+    return re.findall(r"[A-Za-z0-9']+", (s or "").lower())
+
+
+def _title_sentiment_score(s: str) -> float:
+    toks = _tokenize_title(s)
+    if not toks:
+        return 0.0
+    pos = sum(t in _POSITIVE_WORDS for t in toks)
+    neg = sum(t in _NEGATIVE_WORDS for t in toks)
+    return float((pos - neg) / max(len(toks), 1))
+
+
+def _rolling_slope(series: pd.Series, n: int) -> pd.Series:
+    y = series.astype(float)
+    x = np.arange(n, dtype=float)
+
+    def slope(arr: np.ndarray) -> float:
+        if np.any(np.isnan(arr)):
+            return np.nan
+        xm = x.mean()
+        ym = arr.mean()
+        denom = ((x - xm) ** 2).sum()
+        if denom == 0:
+            return 0.0
+        return float(((x - xm) * (arr - ym)).sum() / denom)
+
+    return y.rolling(n, min_periods=n).apply(lambda w: slope(w.to_numpy()), raw=False)
+
+
+def get_feature_list(use_post: bool) -> List[str]:
+    base_feats = [
+        "log_duration",
+        "title_len",
+        "title_words",
+        "title_upper_ratio",
+        "title_digit_ratio",
+        "title_exclaim_count",
+        "title_question_count",
+        "title_has_number",
+        "title_has_question",
+        "title_has_exclaim",
+        "title_sentiment",
+        "published_hour",
+        "published_dow",
+        "published_month",
+        "days_since_upload",
+        "prev_views",
+        "prev_like_ratio",
+        "prev_comment_ratio",
+        "prev_engagement",
+        "ch_roll_avg_views",
+        "ch_roll_med_views",
+        "ch_roll_std_views",
+        "ch_roll_min_views",
+        "ch_roll_max_views",
+        "ch_roll_avg_duration",
+        "ch_roll_avg_title_len",
+        "ch_trend_slope",
+        "is_short",
+    ]
+    post_feats = ["like_ratio", "comment_ratio", "engagement"]
+    return base_feats + (post_feats if use_post else [])
 
 
 def build_feature_frame(videos: pd.DataFrame, baseline_n: int = 10) -> pd.DataFrame:
@@ -53,6 +133,14 @@ def build_feature_frame(videos: pd.DataFrame, baseline_n: int = 10) -> pd.DataFr
     df["log_duration"] = np.log1p(df["duration_sec"].fillna(0).clip(lower=0))
     df["title_len"] = df["title"].str.len().clip(upper=250)
     df["title_words"] = df["title"].str.split().str.len().clip(upper=60)
+    df["title_upper_ratio"] = _safe_div(df["title"].str.count(r"[A-Z]"), df["title_len"].replace(0, np.nan)).fillna(0).clip(0, 1)
+    df["title_digit_ratio"] = _safe_div(df["title"].str.count(r"\d"), df["title_len"].replace(0, np.nan)).fillna(0).clip(0, 1)
+    df["title_exclaim_count"] = df["title"].str.count(r"!").clip(upper=10)
+    df["title_question_count"] = df["title"].str.count(r"\?").clip(upper=10)
+    df["title_has_number"] = df["title"].str.contains(r"\d", regex=True, na=False).astype(int)
+    df["title_has_question"] = df["title"].str.contains(r"\?", regex=True, na=False).astype(int)
+    df["title_has_exclaim"] = df["title"].str.contains(r"!", regex=True, na=False).astype(int)
+    df["title_sentiment"] = df["title"].map(_title_sentiment_score).clip(-1, 1)
 
     df["published_hour"] = df["published_at"].dt.hour.astype(int)
     df["published_dow"] = df["published_at"].dt.dayofweek.astype(int)
@@ -66,32 +154,31 @@ def build_feature_frame(videos: pd.DataFrame, baseline_n: int = 10) -> pd.DataFr
 
     g = df.groupby("channel_id", group_keys=False)
 
+    # prior-video leakage-safe features
+    df["prev_views"] = g["views"].shift(1)
+    df["prev_like_ratio"] = g["like_ratio"].shift(1)
+    df["prev_comment_ratio"] = g["comment_ratio"].shift(1)
+    df["prev_engagement"] = g["engagement"].shift(1)
+
     # baseline (shifted rolling)
-    df["ch_roll_avg_views"] = g["views"].apply(lambda s: s.shift(1).rolling(baseline_n, min_periods=baseline_n).mean())
-    df["ch_roll_med_views"] = g["views"].apply(lambda s: s.shift(1).rolling(baseline_n, min_periods=baseline_n).median())
-    df["ch_roll_std_views"] = g["views"].apply(lambda s: s.shift(1).rolling(baseline_n, min_periods=baseline_n).std())
+    shifted_views = g["views"].shift(1)
+    df["ch_roll_avg_views"] = shifted_views.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).mean().reset_index(level=0, drop=True)
+    df["ch_roll_med_views"] = shifted_views.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).median().reset_index(level=0, drop=True)
+    df["ch_roll_std_views"] = shifted_views.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).std().reset_index(level=0, drop=True)
+    df["ch_roll_min_views"] = shifted_views.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).min().reset_index(level=0, drop=True)
+    df["ch_roll_max_views"] = shifted_views.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).max().reset_index(level=0, drop=True)
+
+    shifted_duration = g["duration_sec"].shift(1)
+    df["ch_roll_avg_duration"] = shifted_duration.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).mean().reset_index(level=0, drop=True)
+
+    shifted_title_len = g["title_len"].shift(1)
+    df["ch_roll_avg_title_len"] = shifted_title_len.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).mean().reset_index(level=0, drop=True)
 
     # cadence
     df["days_since_upload"] = g["published_at"].apply(lambda s: s.diff().dt.total_seconds() / 86400.0)
     df["days_since_upload"] = df["days_since_upload"].clip(lower=0).clip(upper=365)
 
     # simple trend proxy: slope over last N uploads (shifted)
-    def _rolling_slope(series: pd.Series, n: int) -> pd.Series:
-        y = series.astype(float)
-        x = np.arange(n, dtype=float)
-
-        def slope(arr: np.ndarray) -> float:
-            if np.any(np.isnan(arr)):
-                return np.nan
-            xm = x.mean()
-            ym = arr.mean()
-            denom = ((x - xm) ** 2).sum()
-            if denom == 0:
-                return 0.0
-            return float(((x - xm) * (arr - ym)).sum() / denom)
-
-        return y.rolling(n, min_periods=n).apply(lambda w: slope(w.to_numpy()), raw=False)
-
     df["ch_trend_slope"] = g["views"].apply(lambda s: _rolling_slope(s.shift(1), baseline_n))
 
     # target: ratio vs baseline, then log1p
@@ -123,17 +210,7 @@ def train_view_model(
       - If the test set is tiny, perm_importance will be None (to keep things stable/fast).
     """
     df = feature_df.copy().sort_values(["channel_id", "published_at"]).reset_index(drop=True)
-
-    base_feats = [
-        "log_duration", "title_len", "title_words",
-        "published_hour", "published_dow", "published_month",
-        "days_since_upload",
-        "ch_roll_avg_views", "ch_roll_med_views", "ch_roll_std_views",
-        "ch_trend_slope",
-        "is_short",
-    ]
-    post_feats = ["like_ratio", "comment_ratio", "engagement"]
-    feats = base_feats + (post_feats if use_post_publish_features else [])
+    feats = get_feature_list(use_post=use_post_publish_features)
 
     if split_mode == "channel_holdout":
         channels = df["channel_id"].dropna().unique().tolist()
@@ -199,9 +276,7 @@ def train_view_model(
     try:
         n_test = len(test)
         sample_n = int(min(perm_max_rows, n_test))
-        # importance is noisy on tiny samples; require a reasonable number
         if sample_n >= 200:
-            # deterministic evenly-spaced sample (keeps it stable across runs)
             idx = np.linspace(0, n_test - 1, sample_n).astype(int)
             r = permutation_importance(
                 model,
@@ -218,7 +293,6 @@ def train_view_model(
     except Exception:
         perm_df = None
 
-    # Helpful for downstream: keep feature order attached to the model
     model.feature_names_in_ = np.array(feats, dtype=object)
 
     return TrainResult(model=model, feature_names=feats, metrics=metrics, perm_importance=perm_df)

@@ -45,7 +45,7 @@ except Exception:
     XGBRegressor = None
 
 from db import load_all_videos_df
-from model_views import build_feature_frame
+from model_views import build_feature_frame, get_feature_list
 
 
 def now_tag() -> str:
@@ -63,18 +63,6 @@ def clip_ratio(r: np.ndarray, lo: float = 0.0, hi: float = 50.0) -> np.ndarray:
 def safe_mape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(mean_absolute_percentage_error(np.maximum(y_true, 1.0), np.maximum(y_pred, 1.0)))
 
-
-def get_feature_list(use_post: bool) -> List[str]:
-    base_feats = [
-        "log_duration", "title_len", "title_words",
-        "published_hour", "published_dow", "published_month",
-        "days_since_upload",
-        "ch_roll_avg_views", "ch_roll_med_views", "ch_roll_std_views",
-        "ch_trend_slope",
-        "is_short",
-    ]
-    post_feats = ["like_ratio", "comment_ratio", "engagement"]
-    return base_feats + (post_feats if use_post else [])
 
 
 def split_train_test(

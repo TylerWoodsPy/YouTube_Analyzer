@@ -28,7 +28,7 @@ from transform import videos_to_rows
 
 from harvest import resolve_channel_id, harvest_one
 
-from model_views import build_feature_frame, train_view_model
+from model_views import build_feature_frame, train_view_model, _title_sentiment_score
 
 from db import (
     upsert_channel,
@@ -555,17 +555,42 @@ if "df" in st.session_state:
                 last_pub = pd.to_datetime(ctx["published_at"].iloc[-1], utc=True)
                 days_since = float(max((planned_utc - last_pub).total_seconds() / 86400.0, 0.0))
 
+                title_len = float(len(planned_title))
+                upper_count = sum(1 for ch in planned_title if ch.isupper())
+                digit_count = sum(1 for ch in planned_title if ch.isdigit())
+                exclaim_count = planned_title.count("!")
+                question_count = planned_title.count("?")
+                recent_views = ctx["views"].tail(bn)
+                recent_duration = ctx["duration_sec"].tail(bn)
+                recent_title_len = ctx["title"].fillna("").astype(str).tail(bn).str.len()
+
                 row = {
                     "log_duration": float(np.log1p(max(planned_duration, 0.0))),
-                    "title_len": float(len(planned_title)),
+                    "title_len": title_len,
                     "title_words": float(len(planned_title.split())),
+                    "title_upper_ratio": float(upper_count / title_len) if title_len > 0 else 0.0,
+                    "title_digit_ratio": float(digit_count / title_len) if title_len > 0 else 0.0,
+                    "title_exclaim_count": float(min(exclaim_count, 10)),
+                    "title_question_count": float(min(question_count, 10)),
+                    "title_has_number": float(any(ch.isdigit() for ch in planned_title)),
+                    "title_has_question": float("?" in planned_title),
+                    "title_has_exclaim": float("!" in planned_title),
+                    "title_sentiment": float(_title_sentiment_score(planned_title)),
                     "published_hour": float(planned_utc.hour),
                     "published_dow": float(planned_utc.dayofweek),
                     "published_month": float(planned_utc.month),
                     "days_since_upload": float(min(days_since, 365.0)),
+                    "prev_views": float(ctx["views"].iloc[-1]),
+                    "prev_like_ratio": 0.0,
+                    "prev_comment_ratio": 0.0,
+                    "prev_engagement": 0.0,
                     "ch_roll_avg_views": float(baseline),
-                    "ch_roll_med_views": float(ctx["views"].tail(bn).median()),
-                    "ch_roll_std_views": float(ctx["views"].tail(bn).std() if bn > 1 else 0.0),
+                    "ch_roll_med_views": float(recent_views.median()),
+                    "ch_roll_std_views": float(recent_views.std() if bn > 1 else 0.0),
+                    "ch_roll_min_views": float(recent_views.min()),
+                    "ch_roll_max_views": float(recent_views.max()),
+                    "ch_roll_avg_duration": float(recent_duration.mean()),
+                    "ch_roll_avg_title_len": float(recent_title_len.mean()),
                     "ch_trend_slope": 0.0,
                     "is_short": float(planned_duration <= 60),
                     # no post-publish info pre-upload
