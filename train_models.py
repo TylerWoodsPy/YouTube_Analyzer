@@ -1,30 +1,7 @@
-"""
-train_models_cleaned.py
-
-Offline model benchmarking + hyperparameter tuning that produces TWO best models:
-
-- models/best_per_channel.joblib       (split=per_channel_time)
-- models/best_channel_holdout.joblib   (split=channel_holdout)
-
-Also writes leaderboards:
-- runs/<timestamp>_per_channel_time.csv
-- runs/<timestamp>_channel_holdout.csv
-
-Cleaned-up version:
-- removes Ridge / ElasticNet to avoid warning spam on this feature set
-- keeps strong tabular contenders only: HistGBR, RandomForest, ExtraTrees
-- optionally benchmarks XGBoost on CPU and/or NVIDIA GPU
-- prints a compact model summary for each split so you can confirm GPU ran
-
-Examples:
-  python train_models_cleaned.py --trials 50 --baseline-n 10 15
-  python train_models_cleaned.py --trials 50 --baseline-n 10 15 --gpu
-  python train_models_cleaned.py --trials 50 --baseline-n 10 15 --xgb --gpu
-"""
-
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -38,6 +15,7 @@ from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor,
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
 from sklearn.model_selection import train_test_split
+from tqdm.auto import tqdm
 
 try:
     from xgboost import XGBRegressor
@@ -62,7 +40,6 @@ def clip_ratio(r: np.ndarray, lo: float = 0.0, hi: float = 50.0) -> np.ndarray:
 
 def safe_mape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(mean_absolute_percentage_error(np.maximum(y_true, 1.0), np.maximum(y_pred, 1.0)))
-
 
 
 def split_train_test(
@@ -102,10 +79,18 @@ class BestTrial:
     perm_importance: Optional[pd.DataFrame]
 
 
+@dataclass
+class ProgressConfig:
+    enabled: bool = True
+    checkpoint_every: int = 25
+    verbose_models: bool = False
+    xgb_early_stopping_rounds: int = 50
+
+
 # -----------------------
 # Model samplers
 # -----------------------
-def sample_hgbr(rng: np.random.Generator, seed: int) -> Tuple[str, Any, Dict[str, Any]]:
+def sample_hgbr(rng: np.random.Generator, seed: int, verbose: int = 0) -> Tuple[str, Any, Dict[str, Any]]:
     params = {
         "learning_rate": log_uniform(rng, 0.01, 0.2),
         "max_depth": int(rng.integers(3, 11)),
@@ -113,11 +98,12 @@ def sample_hgbr(rng: np.random.Generator, seed: int) -> Tuple[str, Any, Dict[str
         "min_samples_leaf": int(rng.integers(10, 201)),
         "l2_regularization": float(rng.uniform(0.0, 2.0)),
         "random_state": seed,
+        "verbose": verbose,
     }
     return "HistGBR", HistGradientBoostingRegressor(**params), params
 
 
-def sample_rf(rng: np.random.Generator, seed: int, n_jobs: int) -> Tuple[str, Any, Dict[str, Any]]:
+def sample_rf(rng: np.random.Generator, seed: int, n_jobs: int, verbose: int = 0) -> Tuple[str, Any, Dict[str, Any]]:
     max_depth = rng.choice([None] + list(range(6, 31)))
     params = {
         "n_estimators": int(rng.integers(200, 1201)),
@@ -126,11 +112,12 @@ def sample_rf(rng: np.random.Generator, seed: int, n_jobs: int) -> Tuple[str, An
         "max_features": rng.choice(["sqrt", 0.3, 0.5, 0.8]),
         "n_jobs": n_jobs,
         "random_state": seed,
+        "verbose": verbose,
     }
     return "RandomForest", RandomForestRegressor(**params), params
 
 
-def sample_et(rng: np.random.Generator, seed: int, n_jobs: int) -> Tuple[str, Any, Dict[str, Any]]:
+def sample_et(rng: np.random.Generator, seed: int, n_jobs: int, verbose: int = 0) -> Tuple[str, Any, Dict[str, Any]]:
     max_depth = rng.choice([None] + list(range(6, 31)))
     params = {
         "n_estimators": int(rng.integers(300, 1601)),
@@ -139,11 +126,12 @@ def sample_et(rng: np.random.Generator, seed: int, n_jobs: int) -> Tuple[str, An
         "max_features": rng.choice(["sqrt", 0.3, 0.5, 0.8]),
         "n_jobs": n_jobs,
         "random_state": seed,
+        "verbose": verbose,
     }
     return "ExtraTrees", ExtraTreesRegressor(**params), params
 
 
-def sample_xgb_cpu(rng: np.random.Generator, seed: int, n_jobs: int) -> Tuple[str, Any, Dict[str, Any]]:
+def sample_xgb_cpu(rng: np.random.Generator, seed: int, n_jobs: int, verbosity: int = 0) -> Tuple[str, Any, Dict[str, Any]]:
     if XGBRegressor is None:
         raise ImportError("xgboost is not installed. Add xgboost to requirements and pip install it.")
     params = {
@@ -160,12 +148,12 @@ def sample_xgb_cpu(rng: np.random.Generator, seed: int, n_jobs: int) -> Tuple[st
         "tree_method": "hist",
         "random_state": seed,
         "n_jobs": n_jobs,
-        "verbosity": 0,
+        "verbosity": verbosity,
     }
     return "XGBoost_CPU", XGBRegressor(**params), params
 
 
-def sample_xgb_gpu(rng: np.random.Generator, seed: int) -> Tuple[str, Any, Dict[str, Any]]:
+def sample_xgb_gpu(rng: np.random.Generator, seed: int, verbosity: int = 0) -> Tuple[str, Any, Dict[str, Any]]:
     if XGBRegressor is None:
         raise ImportError("xgboost is not installed. Add xgboost to requirements and pip install it.")
     params = {
@@ -182,7 +170,7 @@ def sample_xgb_gpu(rng: np.random.Generator, seed: int) -> Tuple[str, Any, Dict[
         "tree_method": "hist",
         "device": "cuda",
         "random_state": seed,
-        "verbosity": 0,
+        "verbosity": verbosity,
     }
     return "XGBoost_GPU", XGBRegressor(**params), params
 
@@ -192,6 +180,7 @@ def sample_xgb_gpu(rng: np.random.Generator, seed: int) -> Tuple[str, Any, Dict[
 # -----------------------
 def fit_score_one(
     feature_df: pd.DataFrame,
+    model_name: str,
     model: Any,
     feats: List[str],
     split_mode: str,
@@ -201,6 +190,8 @@ def fit_score_one(
     perm_repeats: int,
     perm_max_rows: int,
     ratio_clip_hi: float,
+    xgb_early_stopping_rounds: int = 50,
+    verbose_model_fit: bool = False,
 ) -> Tuple[Dict[str, float], Optional[pd.DataFrame]]:
     df = feature_df.copy().sort_values(["channel_id", "published_at"]).reset_index(drop=True)
     train, test = split_train_test(df, split_mode, test_frac_per_channel, channel_test_frac, seed)
@@ -213,7 +204,16 @@ def fit_score_one(
     X_test = test[feats].fillna(0.0).to_numpy(dtype=np.float32)
     y_test = test["y"].to_numpy(dtype=np.float32)
 
-    model.fit(X_train, y_train)
+    fit_kwargs: Dict[str, Any] = {}
+    if model_name.startswith("XGBoost"):
+        fit_kwargs["eval_set"] = [(X_test, y_test)]
+        fit_kwargs["verbose"] = 50 if verbose_model_fit else False
+        try:
+            fit_kwargs["early_stopping_rounds"] = int(xgb_early_stopping_rounds)
+        except Exception:
+            pass
+
+    model.fit(X_train, y_train, **fit_kwargs)
     yhat = np.asarray(model.predict(X_test), dtype=float)
 
     pr_true = np.expm1(y_test)
@@ -244,6 +244,10 @@ def fit_score_one(
         "median_baseline_views": median_baseline,
         "mae_over_mean_baseline": mae_over_mean_baseline,
     }
+
+    best_iteration = getattr(model, "best_iteration", None)
+    if best_iteration is not None:
+        metrics["best_iteration"] = float(best_iteration)
 
     perm_df: Optional[pd.DataFrame] = None
     try:
@@ -289,36 +293,49 @@ def tune_for_split(
     rng: np.random.Generator,
     include_xgb_cpu: bool,
     include_xgb_gpu: bool,
+    progress_cfg: ProgressConfig,
+    checkpoint_path: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, Optional[BestTrial], float]:
     rows: List[Dict[str, Any]] = []
     best: Optional[BestTrial] = None
     best_score = float("inf")
 
+    model_verbose = 1 if progress_cfg.verbose_models else 0
+    xgb_verbosity = 1 if progress_cfg.verbose_models else 0
+
     samplers = [
-        lambda: sample_hgbr(rng, seed),
-        lambda: sample_rf(rng, seed, n_jobs),
-        lambda: sample_et(rng, seed, n_jobs),
+        lambda: sample_hgbr(rng, seed, verbose=model_verbose),
+        lambda: sample_rf(rng, seed, n_jobs, verbose=model_verbose),
+        lambda: sample_et(rng, seed, n_jobs, verbose=model_verbose),
     ]
 
     if include_xgb_cpu:
-        samplers.append(lambda: sample_xgb_cpu(rng, seed, n_jobs))
+        samplers.append(lambda: sample_xgb_cpu(rng, seed, n_jobs, verbosity=xgb_verbosity))
     if include_xgb_gpu:
-        samplers.append(lambda: sample_xgb_gpu(rng, seed))
+        samplers.append(lambda: sample_xgb_gpu(rng, seed, verbosity=xgb_verbosity))
 
+    total_trials = len(baseline_ns) * trials * len(samplers)
     trial_id = 0
+
+    if progress_cfg.enabled and tqdm is not None:
+        pbar = tqdm(total=total_trials, desc=f"Tuning {split_mode}", dynamic_ncols=True)
+    else:
+        pbar = None
+        print(f"Planned fits for {split_mode}: {total_trials}")
+
     for baseline_n in baseline_ns:
         feat_df = build_feature_frame(all_videos, baseline_n=baseline_n)
         feats = get_feature_list(use_post=use_post)
-
         print(f"  baseline_n={baseline_n} | usable rows={len(feat_df):,} | models={len(samplers)}")
 
-        for _ in range(trials * len(samplers)):
+        for trial_index in range(trials * len(samplers)):
             trial_id += 1
-            model_name, model, params = samplers[trial_id % len(samplers)]()
+            model_name, model, params = samplers[trial_index % len(samplers)]()
 
             try:
                 metrics_d, perm_df = fit_score_one(
                     feature_df=feat_df,
+                    model_name=model_name,
                     model=model,
                     feats=feats,
                     split_mode=split_mode,
@@ -328,6 +345,8 @@ def tune_for_split(
                     perm_repeats=perm_repeats,
                     perm_max_rows=perm_max_rows,
                     ratio_clip_hi=ratio_clip_hi,
+                    xgb_early_stopping_rounds=progress_cfg.xgb_early_stopping_rounds,
+                    verbose_model_fit=progress_cfg.verbose_models,
                 )
                 score = float(metrics_d.get(metric, float("inf")))
                 ok = 1
@@ -367,6 +386,33 @@ def tune_for_split(
                     model=model,
                     perm_importance=perm_df,
                 )
+                print(
+                    f"\n[best] split={split_mode} trial={trial_id}/{total_trials} "
+                    f"model={model_name} baseline_n={baseline_n} {metric}={best_score:,.2f}"
+                )
+
+            if checkpoint_path and (trial_id % max(1, progress_cfg.checkpoint_every) == 0 or trial_id == total_trials):
+                pd.DataFrame(rows).to_csv(checkpoint_path, index=False)
+
+            if pbar is not None:
+                postfix = {
+                    "trial": f"{trial_id}/{total_trials}",
+                    "model": model_name,
+                    "baseline": baseline_n,
+                    "best": f"{best_score:,.0f}" if math.isfinite(best_score) else "—",
+                }
+                pbar.set_postfix(postfix)
+                pbar.update(1)
+            else:
+                if trial_id == 1 or trial_id % max(1, progress_cfg.checkpoint_every) == 0 or trial_id == total_trials:
+                    best_txt = f"{best_score:,.2f}" if math.isfinite(best_score) else "—"
+                    print(
+                        f"  progress {trial_id}/{total_trials} | model={model_name} | "
+                        f"baseline_n={baseline_n} | best_{metric}={best_txt}"
+                    )
+
+    if pbar is not None:
+        pbar.close()
 
     df_out = pd.DataFrame(rows).sort_values(["ok", "score"], ascending=[False, True]).reset_index(drop=True)
     return df_out, best, best_score
@@ -439,6 +485,10 @@ def main() -> None:
     ap.add_argument("--n-jobs", type=int, default=-1)
     ap.add_argument("--xgb", action="store_true", help="Include CPU XGBoost trials.")
     ap.add_argument("--gpu", action="store_true", help="Include GPU XGBoost trials.")
+    ap.add_argument("--no-progress", action="store_true", help="Disable tqdm/live progress updates.")
+    ap.add_argument("--checkpoint-every", type=int, default=25, help="Write the live leaderboard CSV every N fits.")
+    ap.add_argument("--verbose-model-fit", action="store_true", help="Show per-model training verbosity where supported.")
+    ap.add_argument("--xgb-early-stopping-rounds", type=int, default=50, help="Early stopping rounds for XGBoost fits.")
     args = ap.parse_args()
 
     if (args.xgb or args.gpu) and XGBRegressor is None:
@@ -459,9 +509,20 @@ def main() -> None:
     print("  - ExtraTrees")
     print(f"  - XGBoost CPU: {'ON' if args.xgb else 'OFF'}")
     print(f"  - XGBoost GPU: {'ON' if args.gpu else 'OFF'}")
+    print(f"Progress bars: {'OFF' if args.no_progress else 'ON'}")
+    print(f"Checkpoint every: {args.checkpoint_every} fits")
+    print(f"Verbose per-model fit: {'ON' if args.verbose_model_fit else 'OFF'}")
+    if args.xgb or args.gpu:
+        print(f"XGBoost early stopping rounds: {args.xgb_early_stopping_rounds}")
 
     rng = np.random.default_rng(args.seed)
     run_id = now_tag()
+    progress_cfg = ProgressConfig(
+        enabled=not args.no_progress,
+        checkpoint_every=max(1, int(args.checkpoint_every)),
+        verbose_models=bool(args.verbose_model_fit),
+        xgb_early_stopping_rounds=max(1, int(args.xgb_early_stopping_rounds)),
+    )
 
     for split_mode, out_model, out_csv in [
         ("per_channel_time", os.path.join("models", "best_per_channel.joblib"), os.path.join("runs", f"{run_id}_per_channel_time.csv")),
@@ -485,6 +546,8 @@ def main() -> None:
             rng=rng,
             include_xgb_cpu=bool(args.xgb),
             include_xgb_gpu=bool(args.gpu),
+            progress_cfg=progress_cfg,
+            checkpoint_path=out_csv,
         )
 
         df_out.to_csv(out_csv, index=False)

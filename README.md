@@ -41,39 +41,48 @@ It also includes a public **keyword intelligence layer** for analyzing search re
 youtube_analyzer/
 │
 ├── app.py
-│   └── Streamlit dashboard for analytics, growth tracking, keyword intel, and model inference
+│   Streamlit dashboard for analytics, growth tracking,
+│   keyword intelligence, and model inference
 │
 ├── harvest.py
-│   └── Batch ingestion from a .txt list of channel IDs, handles, or names
+│   Batch ingestion from a .txt list of channel IDs,
+│   handles, or channel names
 │
 ├── train_models.py
-│   └── Offline model benchmarking, hyperparameter search, and best-model export
+│   Offline benchmarking and hyperparameter search for
+│   tree / ensemble models (RandomForest, ExtraTrees,
+│   HistGradientBoosting, XGBoost)
+│
+├── train_neural_net.py
+│   Neural network experimentation using
+│   sklearn MLPRegressor with hyperparameter sweeps
 │
 ├── model_views.py
-│   ├── Leakage-safe feature engineering
-│   ├── Rolling channel baseline features
-│   └── Channel-aware train/test logic
+│   Leakage-safe feature engineering and channel-aware
+│   train/test split utilities
 │
 ├── yt_api.py
-│   ├── YouTube Data API helpers
-│   ├── Search and keyword intel helpers
-│   ├── Related video discovery fallback
-│   └── Metadata lookup helpers for graph enrichment
+│   YouTube Data API helpers for search, metadata,
+│   keyword intel, and related-video discovery
 │
 ├── transform.py
-│   └── API → normalized row/dataframe transforms
+│   API response → normalized dataframe / row transforms
 │
 ├── db.py
-│   └── SQLite schema, warehouse utilities, and snapshot delta queries
+│   SQLite schema, warehouse utilities,
+│   and snapshot-based growth queries
 │
 ├── models/
-│   └── Saved model bundles (.joblib)
+│   Saved trained model bundles (.joblib)
 │
 ├── runs/
-│   └── Training leaderboards and experiment outputs
+│   Training leaderboards and experiment outputs
 │
 ├── channels.txt
+│   Input list of channels to harvest
+│
 └── requirements.txt
+    Project Python dependencies
 ```
 
 ---
@@ -86,20 +95,7 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-Main libraries used:
-
-- `streamlit`
-- `pandas`
-- `plotly`
-- `google-api-python-client`
-- `python-dotenv`
-- `isodate`
-- `scikit-learn`
-- `joblib`
-- `numpy`
-- `requests`
-- `networkx`
-- `xgboost`
+All project dependencies are listed in `requirements.txt`.
 
 ---
 
@@ -334,73 +330,181 @@ This helps stabilize training across channels with very different sizes and perf
 
 ---
 
+
 # 🏋️ Offline Model Training
 
-Train models offline with:
+Model experimentation is performed **offline** using the training scripts.
+
+Two training pipelines exist:
+
+```
+train_models.py
+train_neural_net.py
+```
+
+These scripts run hyperparameter sweeps and write experiment leaderboards.
+
+---
+
+## Train Tree / Ensemble Models
+
+Run:
 
 ```bash
 python train_models.py --trials 50 --baseline-n 10 15
 ```
 
-Example with CPU and GPU XGBoost enabled:
+Enable GPU XGBoost:
 
 ```bash
 python train_models.py --trials 50 --baseline-n 10 15 --xgb --gpu
 ```
 
-Another example with a wider baseline sweep:
+Example larger sweep:
 
 ```bash
 python train_models.py --trials 100 --baseline-n 10 15 20
 ```
 
-## Training workflow
+### Training workflow
 
-The training script:
+The script:
 
 1. Loads all videos from SQLite
 2. Builds leakage-safe feature frames
-3. Tries multiple model families
+3. Samples model hyperparameters
 4. Benchmarks across split strategies
 5. Writes leaderboard CSV files
-6. Saves the best models to `models/`
+6. Saves the best models
 
-## Model families
+### Model families
 
-Current training pool includes:
+Current model pool:
 
-- `HistGradientBoostingRegressor`
-- `RandomForestRegressor`
-- `ExtraTreesRegressor`
-- `XGBoost` on CPU (optional)
-- `XGBoost` on GPU (optional)
+- HistGradientBoostingRegressor
+- RandomForestRegressor
+- ExtraTreesRegressor
+- XGBoost (CPU)
+- XGBoost (GPU)
+
+---
+
+## Train Neural Network Models
+
+Run:
+
+```bash
+python train_neural_net.py --trials 25 --baseline-n 10 15
+```
+
+This script performs randomized sweeps of:
+
+```
+sklearn.neural_network.MLPRegressor
+```
+
+Outputs:
+
+```
+models/best_neural_net.joblib
+runs/<timestamp>_nn_leaderboard.csv
+```
+
+---
+
+## Training Progress Monitoring
+
+Training scripts now include:
+
+- tqdm progress bars
+- live best‑model updates
+- periodic checkpoint writing
+- optional verbose model training logs
+
+Example output:
+
+```
+██████████░░░░░░░░ 50% | Trial 150 / 300
+Best MAE_views: 278,000
+```
+
+Checkpoint example:
+
+```bash
+python train_models.py --trials 50 --baseline-n 10 15 --checkpoint-every 10
+```
+
+---
+
+## Useful Training Flags
+
+Enable GPU XGBoost:
+
+```bash
+--xgb --gpu
+```
+
+Control number of trials:
+
+```bash
+--trials 50
+```
+
+Try multiple baseline windows:
+
+```bash
+--baseline-n 10 15 20
+```
+
+Disable progress bars:
+
+```bash
+--no-progress
+```
+
+Verbose model training:
+
+```bash
+--verbose-model-fit
+```
+
+Write checkpoint leaderboards periodically:
+
+```bash
+--checkpoint-every 10
+```
+
+---
 
 ## Saved outputs
 
-```text
+```
 models/best_per_channel.joblib
 models/best_channel_holdout.joblib
+models/best_neural_net.joblib
 ```
 
-Leaderboard files are written to:
+Leaderboard files:
 
-```text
+```
 runs/<timestamp>_per_channel_time.csv
 runs/<timestamp>_channel_holdout.csv
+runs/<timestamp>_nn_leaderboard.csv
 ```
 
-Each saved bundle includes:
+Each saved bundle contains:
 
 - trained model
 - feature names
 - evaluation metrics
 - permutation feature importance
-- configuration used for training
-- save timestamp
+- configuration metadata
+- timestamp
 
 ---
 
 # 🧪 Split Modes
+
 
 ## `per_channel_time`
 
