@@ -563,6 +563,17 @@ if "df" in st.session_state:
                 recent_views = ctx["views"].tail(bn)
                 recent_duration = ctx["duration_sec"].tail(bn)
                 recent_title_len = ctx["title"].fillna("").astype(str).tail(bn).str.len()
+                recent_gaps = ctx["published_at"].diff().dt.total_seconds().div(86400.0).tail(bn)
+                recent_short_rate = (ctx["duration_sec"].tail(bn) <= 60).astype(float)
+                recent_3_views = ctx["views"].tail(3)
+                recent_5_views = ctx["views"].tail(5)
+
+                channel_subs = float(stats.get("subscriberCount", 0) or 0)
+                channel_views_total = float(stats.get("viewCount", 0) or 0)
+                channel_video_count = float(stats.get("videoCount", len(ctx)) or len(ctx))
+                channel_start = pd.to_datetime(ctx["published_at"].min(), utc=True)
+                days_since_channel_start = float(max((planned_utc - channel_start).total_seconds() / 86400.0, 0.0))
+                uploads_before_video = float(len(ctx))
 
                 row = {
                     "log_duration": float(np.log1p(max(planned_duration, 0.0))),
@@ -580,10 +591,13 @@ if "df" in st.session_state:
                     "published_dow": float(planned_utc.dayofweek),
                     "published_month": float(planned_utc.month),
                     "days_since_upload": float(min(days_since, 365.0)),
+                    "days_since_channel_start": float(min(days_since_channel_start, 36500.0)),
+                    "uploads_before_video": uploads_before_video,
                     "prev_views": float(ctx["views"].iloc[-1]),
                     "prev_like_ratio": 0.0,
                     "prev_comment_ratio": 0.0,
                     "prev_engagement": 0.0,
+                    "prev_short_rate": float(ctx["duration_sec"].iloc[-1] <= 60),
                     "ch_roll_avg_views": float(baseline),
                     "ch_roll_med_views": float(recent_views.median()),
                     "ch_roll_std_views": float(recent_views.std() if bn > 1 else 0.0),
@@ -591,6 +605,28 @@ if "df" in st.session_state:
                     "ch_roll_max_views": float(recent_views.max()),
                     "ch_roll_avg_duration": float(recent_duration.mean()),
                     "ch_roll_avg_title_len": float(recent_title_len.mean()),
+                    "ch_roll_avg_like_ratio": 0.0,
+                    "ch_roll_avg_comment_ratio": 0.0,
+                    "ch_roll_avg_engagement": 0.0,
+                    "ch_roll_avg_gap_days": float(recent_gaps.mean()) if recent_gaps.notna().any() else 0.0,
+                    "ch_roll_std_gap_days": float(recent_gaps.std()) if recent_gaps.notna().sum() > 1 else 0.0,
+                    "ch_roll_short_rate": float(recent_short_rate.mean()) if len(recent_short_rate) else 0.0,
+                    "ch_recent_3_avg_views": float(recent_3_views.mean()) if len(recent_3_views) >= 3 else float(baseline),
+                    "ch_recent_5_avg_views": float(recent_5_views.mean()) if len(recent_5_views) >= 5 else float(baseline),
+                    "ch_recent_3_engagement": 0.0,
+                    "ch_recent_5_engagement": 0.0,
+                    "baseline_log_views": float(np.log1p(max(baseline, 0.0))),
+                    "baseline_to_prev_views_ratio": float(baseline / max(float(ctx["views"].iloc[-1]), 1.0)),
+                    "baseline_to_channel_total_views_ratio": float(baseline / max(channel_views_total, 1.0)),
+                    "channel_subscriber_count": channel_subs,
+                    "channel_view_count": channel_views_total,
+                    "channel_video_count": channel_video_count,
+                    "channel_views_per_video": float(channel_views_total / max(channel_video_count, 1.0)),
+                    "channel_subs_per_video": float(channel_subs / max(channel_video_count, 1.0)),
+                    "channel_views_per_sub": float(channel_views_total / max(channel_subs, 1.0)) if channel_subs > 0 else 0.0,
+                    "channel_has_subscriber_count": float(channel_subs > 0),
+                    "channel_has_view_count": float(channel_views_total > 0),
+                    "channel_has_video_count": float(channel_video_count > 0),
                     "ch_trend_slope": 0.0,
                     "is_short": float(planned_duration <= 60),
                     # no post-publish info pre-upload

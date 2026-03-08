@@ -36,6 +36,36 @@ class BestTrial:
     perm_importance: Optional[pd.DataFrame]
 
 
+def tqdm_safe_write(message: str, pbar: Optional[Any] = None) -> None:
+    if pbar is not None:
+        pbar.write(message)
+    else:
+        print(message)
+
+
+def print_run_header(rows_loaded: int, feature_count: int, show_progress: bool, verbose_fit: bool, early_stopping: bool) -> None:
+    print("\nYouTube Analyzer Neural Net Training")
+    print("-" * 37)
+    print(f"Dataset rows: {rows_loaded:,}")
+    print(f"Features: {feature_count}")
+    print("Feature pipeline: title + timing + cadence + momentum + channel-warehouse stats")
+    print("Model pool:")
+    print("  - MLPRegressor (StandardScaler + internal early stopping)")
+    print(f"Progress bars: {'ON' if show_progress else 'OFF'}")
+    print(f"Verbose fit logs: {'ON' if verbose_fit else 'OFF'}")
+    print(f"Internal early stopping: {'ON' if early_stopping else 'OFF'}")
+
+
+def print_split_header(split_mode: str, baseline_n: int, usable_rows: int, trials: int) -> None:
+    print("\n" + "=" * 40)
+    print(f"Split Mode: {split_mode}")
+    print(f"Baseline window: {baseline_n}")
+    print(f"Usable rows: {usable_rows:,}")
+    print("Model: MLPRegressor")
+    print(f"Trials: {trials}")
+    print("=" * 40)
+
+
 def now_tag() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -190,14 +220,66 @@ def fit_score_one(
                 random_state=seed,
             )
             perm_df = (
-                pd.DataFrame({"feature": feats, "importance_mean": r.importances_mean})
-                .sort_values("importance_mean", ascending=False)
+                pd.DataFrame({
+                    "feature": feats,
+                    "importance_mean": r.importances_mean,
+                    "importance_std": r.importances_std,
+                    "importance_abs_mean": np.abs(r.importances_mean),
+                })
+                .sort_values("importance_abs_mean", ascending=False)
                 .reset_index(drop=True)
             )
     except Exception:
         perm_df = None
 
     return metrics, perm_df
+
+
+
+
+def format_top_importance(perm_df: Optional[pd.DataFrame], top_n: int = 10) -> str:
+    if perm_df is None or perm_df.empty:
+        return "Permutation importance unavailable."
+
+    show = perm_df.copy()
+    if "importance_mean" in show.columns:
+        show = show.sort_values("importance_mean", ascending=False)
+    show = show.head(max(1, int(top_n))).reset_index(drop=True)
+
+    lines = []
+    for i, row in show.iterrows():
+        lines.append(f"  {i + 1:>2}. {str(row['feature']):<34} {float(row['importance_mean']):>12.6f}")
+    return "\n".join(lines)
+
+
+def save_perm_importance_csv(perm_df: Optional[pd.DataFrame], out_csv: str) -> Optional[str]:
+    if perm_df is None or perm_df.empty:
+        return None
+    perm_path = out_csv.replace('.csv', '_feature_importance.csv')
+    perm_df.to_csv(perm_path, index=False)
+    return perm_path
+
+
+def summarize_top_importance_for_row(perm_df: Optional[pd.DataFrame], top_n: int = 5) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {}
+    if perm_df is None or perm_df.empty:
+        return summary
+
+    show = perm_df.copy()
+    sort_col = "importance_abs_mean" if "importance_abs_mean" in show.columns else "importance_mean"
+    show = show.sort_values(sort_col, ascending=False).head(max(1, int(top_n))).reset_index(drop=True)
+
+    for i, row in show.iterrows():
+        rank = i + 1
+        summary[f"fi_{rank}_feature"] = str(row.get("feature", ""))
+        if "importance_mean" in row:
+            summary[f"fi_{rank}_mean"] = float(row["importance_mean"])
+        if "importance_std" in row:
+            summary[f"fi_{rank}_std"] = float(row["importance_std"])
+        if "importance_abs_mean" in row:
+            summary[f"fi_{rank}_abs_mean"] = float(row["importance_abs_mean"])
+
+    return summary
 
 
 def print_model_summary(df_out: pd.DataFrame, metric: str) -> None:
@@ -259,14 +341,21 @@ def tune_for_split(
 
     trial_id = 0
     total_trials = max(1, len(baseline_ns) * trials)
-    pbar = tqdm(total=total_trials, disable=not show_progress, desc=f"NN {split_mode}")
+    pbar = tqdm(
+        total=total_trials,
+        disable=not show_progress,
+        desc=f"NN ({split_mode})",
+        dynamic_ncols=True,
+        leave=True,
+        mininterval=0.2,
+    )
 
     try:
         for baseline_n in baseline_ns:
             feat_df = build_feature_frame(all_videos, baseline_n=baseline_n)
             feats = get_feature_list(use_post=use_post)
 
-            print(f"  baseline_n={baseline_n} | usable rows={len(feat_df):,} | model=MLPRegressor")
+            print_split_header(split_mode, baseline_n, len(feat_df), trials)
 
             for _ in range(trials):
                 trial_id += 1
@@ -302,7 +391,7 @@ def tune_for_split(
                     ok = 0
                     err = str(e)
 
-                rows.append({
+                row_data = {
                     "ok": ok,
                     "error": err,
                     "trial": trial_id,
@@ -314,7 +403,9 @@ def tune_for_split(
                     "score": score,
                     **metrics_d,
                     "params": str(params),
-                })
+                }
+                row_data.update(summarize_top_importance_for_row(perm_df, top_n=5))
+                rows.append(row_data)
 
                 if ok and score < best_score:
                     best_score = score
@@ -326,13 +417,14 @@ def tune_for_split(
                         split_mode=split_mode,
                         seed=seed,
                         feature_names=feats,
-                        metrics={"split_mode": split_mode, **metrics_d},
+                        metrics={"split_mode": split_mode, **metrics_d, **summarize_top_importance_for_row(perm_df, top_n=5)},
                         model=model,
                         perm_importance=perm_df,
                     )
-                    print(
-                        f"[best] split={split_mode} trial={trial_id}/{total_trials} "
-                        f"baseline_n={baseline_n} {metric}={best_score:,.2f}"
+                    tqdm_safe_write(
+                        f"★ New best | MLPRegressor | baseline={baseline_n:<2} | "
+                        f"{metric}={best_score:,.2f} | trial {trial_id}/{total_trials}",
+                        pbar,
                     )
 
                 if show_progress:
@@ -344,7 +436,7 @@ def tune_for_split(
                         postfix["best"] = f"{best_score:,.0f}"
                     if ok and np.isfinite(score):
                         postfix["cur"] = f"{score:,.0f}"
-                    pbar.set_postfix(postfix)
+                    pbar.set_postfix(postfix, refresh=False)
                     pbar.update(1)
 
                 if out_csv and checkpoint_every > 0 and (trial_id % checkpoint_every == 0 or trial_id == total_trials):
@@ -396,6 +488,7 @@ def main() -> None:
     ap.add_argument("--disable-early-stopping", action="store_true", help="Disable MLP internal validation-based early stopping.")
     ap.add_argument("--validation-fraction", type=float, default=0.1, help="MLP validation fraction when early stopping is enabled.")
     ap.add_argument("--n-iter-no-change", type=int, default=20, help="MLP epochs with no improvement before stopping.")
+    ap.add_argument("--top-importance", type=int, default=10, help="How many permutation-importance features to print for the best model.")
     args = ap.parse_args()
 
     os.makedirs("models", exist_ok=True)
@@ -407,11 +500,13 @@ def main() -> None:
         raise SystemExit("No videos found in DB yet. Harvest/analyze at least one channel first.")
 
     print(f"Rows loaded: {len(all_videos):,}")
-    print("Model pool:")
-    print("  - MLPRegressor (StandardScaler + internal early stopping)")
-    print(f"Progress bars: {'OFF' if args.no_progress else 'ON'}")
-    print(f"Verbose fit logs: {'ON' if args.verbose_model_fit else 'OFF'}")
-    print(f"Internal early stopping: {'OFF' if args.disable_early_stopping else 'ON'}")
+    print_run_header(
+        rows_loaded=len(all_videos),
+        feature_count=len(get_feature_list(use_post=args.use_post)),
+        show_progress=not args.no_progress,
+        verbose_fit=args.verbose_model_fit,
+        early_stopping=not args.disable_early_stopping,
+    )
 
     rng = np.random.default_rng(args.seed)
     run_id = now_tag()
@@ -448,6 +543,8 @@ def main() -> None:
         print(f"Wrote leaderboard: {out_csv}")
         print_model_summary(df_out, args.metric)
 
+        perm_csv = save_perm_importance_csv(getattr(best, "perm_importance", None) if best is not None else None, out_csv)
+
         if best is None:
             print("No successful trials for this split.")
             continue
@@ -464,6 +561,10 @@ def main() -> None:
             f"mean baseline: {m.get('mean_baseline_views', float('nan')):,.0f} | "
             f"MAE/mean baseline: {m.get('mae_over_mean_baseline', float('nan')):.2f}×"
         )
+        if perm_csv:
+            print(f"Permutation importance CSV: {perm_csv}")
+        print("Top permutation importance features:")
+        print(format_top_importance(best.perm_importance, top_n=args.top_importance))
         if "epochs_run" in m:
             print(f"Epochs run: {m.get('epochs_run', float('nan')):.0f}")
 

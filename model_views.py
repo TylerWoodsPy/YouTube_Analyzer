@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Optional, List
 
+from db import load_channels_df
+
 import numpy as np
 import pandas as pd
 
@@ -88,10 +90,13 @@ def get_feature_list(use_post: bool) -> List[str]:
         "published_dow",
         "published_month",
         "days_since_upload",
+        "days_since_channel_start",
+        "uploads_before_video",
         "prev_views",
         "prev_like_ratio",
         "prev_comment_ratio",
         "prev_engagement",
+        "prev_short_rate",
         "ch_roll_avg_views",
         "ch_roll_med_views",
         "ch_roll_std_views",
@@ -99,6 +104,28 @@ def get_feature_list(use_post: bool) -> List[str]:
         "ch_roll_max_views",
         "ch_roll_avg_duration",
         "ch_roll_avg_title_len",
+        "ch_roll_avg_like_ratio",
+        "ch_roll_avg_comment_ratio",
+        "ch_roll_avg_engagement",
+        "ch_roll_avg_gap_days",
+        "ch_roll_std_gap_days",
+        "ch_roll_short_rate",
+        "ch_recent_3_avg_views",
+        "ch_recent_5_avg_views",
+        "ch_recent_3_engagement",
+        "ch_recent_5_engagement",
+        "baseline_log_views",
+        "baseline_to_prev_views_ratio",
+        "baseline_to_channel_total_views_ratio",
+        "channel_subscriber_count",
+        "channel_view_count",
+        "channel_video_count",
+        "channel_views_per_video",
+        "channel_subs_per_video",
+        "channel_views_per_sub",
+        "channel_has_subscriber_count",
+        "channel_has_view_count",
+        "channel_has_video_count",
         "ch_trend_slope",
         "is_short",
     ]
@@ -111,6 +138,11 @@ def build_feature_frame(videos: pd.DataFrame, baseline_n: int = 10) -> pd.DataFr
     Input videos DF must include:
       channel_id, published_at (datetime), views, likes, comments, duration_sec, title
     Returns a feature DF with leakage-safe rolling channel features (shifted).
+
+    New additions:
+      - merges channel warehouse stats from `channels`
+      - adds stronger recent-momentum / cadence / engagement baselines
+      - exposes baseline-scale features directly to the model
     """
     df = videos.copy()
 
@@ -127,6 +159,26 @@ def build_feature_frame(videos: pd.DataFrame, baseline_n: int = 10) -> pd.DataFr
 
     df = df.dropna(subset=["channel_id", "published_at", "views"])
     df = df.sort_values(["channel_id", "published_at"]).reset_index(drop=True)
+
+    # merge latest channel-level warehouse stats when available
+    try:
+        channels = load_channels_df().copy()
+    except Exception:
+        channels = pd.DataFrame()
+
+    if not channels.empty and "channel_id" in channels.columns:
+        keep = [c for c in ["channel_id", "subscriber_count", "view_count", "video_count"] if c in channels.columns]
+        channels = channels[keep].drop_duplicates(subset=["channel_id"], keep="last")
+        channels = channels.rename(columns={
+            "subscriber_count": "channel_subscriber_count",
+            "view_count": "channel_view_count",
+            "video_count": "channel_video_count",
+        })
+        df = df.merge(channels, on="channel_id", how="left")
+    else:
+        df["channel_subscriber_count"] = np.nan
+        df["channel_view_count"] = np.nan
+        df["channel_video_count"] = np.nan
 
     # video-level features
     df["is_short"] = (df["duration_sec"].fillna(0) <= 60).astype(int)
@@ -154,35 +206,74 @@ def build_feature_frame(videos: pd.DataFrame, baseline_n: int = 10) -> pd.DataFr
 
     g = df.groupby("channel_id", group_keys=False)
 
+    # channel-history clocks
+    df["uploads_before_video"] = g.cumcount().astype(float)
+    channel_start = g["published_at"].transform("min")
+    df["days_since_channel_start"] = (df["published_at"] - channel_start).dt.total_seconds() / 86400.0
+    df["days_since_channel_start"] = df["days_since_channel_start"].clip(lower=0, upper=36500)
+
     # prior-video leakage-safe features
     df["prev_views"] = g["views"].shift(1)
     df["prev_like_ratio"] = g["like_ratio"].shift(1)
     df["prev_comment_ratio"] = g["comment_ratio"].shift(1)
     df["prev_engagement"] = g["engagement"].shift(1)
-
-    # baseline (shifted rolling)
-    shifted_views = g["views"].shift(1)
-    df["ch_roll_avg_views"] = shifted_views.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).mean().reset_index(level=0, drop=True)
-    df["ch_roll_med_views"] = shifted_views.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).median().reset_index(level=0, drop=True)
-    df["ch_roll_std_views"] = shifted_views.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).std().reset_index(level=0, drop=True)
-    df["ch_roll_min_views"] = shifted_views.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).min().reset_index(level=0, drop=True)
-    df["ch_roll_max_views"] = shifted_views.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).max().reset_index(level=0, drop=True)
-
-    shifted_duration = g["duration_sec"].shift(1)
-    df["ch_roll_avg_duration"] = shifted_duration.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).mean().reset_index(level=0, drop=True)
-
-    shifted_title_len = g["title_len"].shift(1)
-    df["ch_roll_avg_title_len"] = shifted_title_len.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).mean().reset_index(level=0, drop=True)
+    df["prev_short_rate"] = g["is_short"].shift(1).fillna(0).astype(float)
 
     # cadence
     df["days_since_upload"] = g["published_at"].apply(lambda s: s.diff().dt.total_seconds() / 86400.0)
     df["days_since_upload"] = df["days_since_upload"].clip(lower=0).clip(upper=365)
 
+    # baseline (shifted rolling)
+    shifted_views = g["views"].shift(1)
+    shifted_duration = g["duration_sec"].shift(1)
+    shifted_title_len = g["title_len"].shift(1)
+    shifted_like_ratio = g["like_ratio"].shift(1)
+    shifted_comment_ratio = g["comment_ratio"].shift(1)
+    shifted_engagement = g["engagement"].shift(1)
+    shifted_gap_days = g["days_since_upload"].shift(1)
+    shifted_is_short = g["is_short"].shift(1)
+
+    df["ch_roll_avg_views"] = shifted_views.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).mean().reset_index(level=0, drop=True)
+    df["ch_roll_med_views"] = shifted_views.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).median().reset_index(level=0, drop=True)
+    df["ch_roll_std_views"] = shifted_views.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).std().reset_index(level=0, drop=True)
+    df["ch_roll_min_views"] = shifted_views.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).min().reset_index(level=0, drop=True)
+    df["ch_roll_max_views"] = shifted_views.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).max().reset_index(level=0, drop=True)
+    df["ch_roll_avg_duration"] = shifted_duration.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).mean().reset_index(level=0, drop=True)
+    df["ch_roll_avg_title_len"] = shifted_title_len.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).mean().reset_index(level=0, drop=True)
+    df["ch_roll_avg_like_ratio"] = shifted_like_ratio.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).mean().reset_index(level=0, drop=True)
+    df["ch_roll_avg_comment_ratio"] = shifted_comment_ratio.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).mean().reset_index(level=0, drop=True)
+    df["ch_roll_avg_engagement"] = shifted_engagement.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).mean().reset_index(level=0, drop=True)
+    df["ch_roll_avg_gap_days"] = shifted_gap_days.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).mean().reset_index(level=0, drop=True)
+    df["ch_roll_std_gap_days"] = shifted_gap_days.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).std().reset_index(level=0, drop=True)
+    df["ch_roll_short_rate"] = shifted_is_short.groupby(df["channel_id"]).rolling(baseline_n, min_periods=baseline_n).mean().reset_index(level=0, drop=True)
+
+    # very recent momentum windows
+    df["ch_recent_3_avg_views"] = shifted_views.groupby(df["channel_id"]).rolling(3, min_periods=3).mean().reset_index(level=0, drop=True)
+    df["ch_recent_5_avg_views"] = shifted_views.groupby(df["channel_id"]).rolling(5, min_periods=5).mean().reset_index(level=0, drop=True)
+    df["ch_recent_3_engagement"] = shifted_engagement.groupby(df["channel_id"]).rolling(3, min_periods=3).mean().reset_index(level=0, drop=True)
+    df["ch_recent_5_engagement"] = shifted_engagement.groupby(df["channel_id"]).rolling(5, min_periods=5).mean().reset_index(level=0, drop=True)
+
     # simple trend proxy: slope over last N uploads (shifted)
     df["ch_trend_slope"] = g["views"].apply(lambda s: _rolling_slope(s.shift(1), baseline_n))
 
-    # target: ratio vs baseline, then log1p
+    # expose baseline scale directly
     df["baseline_views"] = df["ch_roll_avg_views"]
+    df["baseline_log_views"] = np.log1p(df["baseline_views"])
+    df["baseline_to_prev_views_ratio"] = _safe_div(df["baseline_views"], df["prev_views"]).replace([np.inf, -np.inf], np.nan)
+
+    # channel warehouse-derived scale features
+    df["channel_has_subscriber_count"] = df["channel_subscriber_count"].notna().astype(int)
+    df["channel_has_view_count"] = df["channel_view_count"].notna().astype(int)
+    df["channel_has_video_count"] = df["channel_video_count"].notna().astype(int)
+    df["channel_subscriber_count"] = pd.to_numeric(df["channel_subscriber_count"], errors="coerce")
+    df["channel_view_count"] = pd.to_numeric(df["channel_view_count"], errors="coerce")
+    df["channel_video_count"] = pd.to_numeric(df["channel_video_count"], errors="coerce")
+    df["channel_views_per_video"] = _safe_div(df["channel_view_count"], df["channel_video_count"]).replace([np.inf, -np.inf], np.nan)
+    df["channel_subs_per_video"] = _safe_div(df["channel_subscriber_count"], df["channel_video_count"]).replace([np.inf, -np.inf], np.nan)
+    df["channel_views_per_sub"] = _safe_div(df["channel_view_count"], df["channel_subscriber_count"]).replace([np.inf, -np.inf], np.nan)
+    df["baseline_to_channel_total_views_ratio"] = _safe_div(df["baseline_views"], df["channel_view_count"]).replace([np.inf, -np.inf], np.nan)
+
+    # target: ratio vs baseline, then log1p
     df["perf_ratio"] = _safe_div(df["views"], df["baseline_views"])
     df["y"] = np.log1p(df["perf_ratio"])
 
